@@ -33,7 +33,7 @@ app.include_router(
 
 app.include_router(
     analysis.router,
-    prefix="/api"
+    prefix="/api/v1"
 )
 
 
