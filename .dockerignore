@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local environment and runtime data
+.env
+data/
+
+# Tooling and docs not needed to run the API
+.git/
+.gitignore
+tests/
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Editors
+.vscode/
+.idea/

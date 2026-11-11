@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: earth-alive-api:dev
+    container_name: earth-alive-api
+    # --reload watches the bind-mounted ./app directory.
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    # Earthdata credentials. Missing .env is tolerated; the app then falls back
+    # to the netrc strategy and reports auth failures as 503.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Docker Desktop bind mounts do not emit inotify events on Windows/macOS.
+      WATCHFILES_FORCE_POLLING: "true"
+      # conda-forge GDAL with the HDF4 plugin, installed in the image.
+      GDAL_TRANSLATE: "/opt/gdal/bin/gdal_translate"
+    volumes:
+      # Live source for uvicorn --reload.
+      - ./app:/srv/backend/backend/app
+      # Downloaded granules and processed artifacts, shared with the host.
+      - ./data:/srv/backend/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    init: true
+    restart: unless-stopped

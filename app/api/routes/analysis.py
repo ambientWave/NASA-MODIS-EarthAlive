@@ -215,6 +215,8 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
             time_series_payload = collect_mod11a1_timeseries(config)
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=f"Processing timeout: {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=f"Processing environment is not configured: {exc}") from exc
         except (ConnectionError, OSError) as exc:
             raise HTTPException(status_code=503, detail=f"NASA Earthdata connection failure: {exc}") from exc
         except ValueError as exc:
@@ -227,7 +229,28 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
         try:
             validation = validate_time_series(records)
         except ValueError as exc:
-            raise HTTPException(status_code=404, detail=f"No valid observations: {exc}") from exc
+            reasons = sorted(
+                {
+                    str(record.get("missing_reason") or "").strip()
+                    for record in time_series_payload.get("records", [])
+                    if record.get("missing_reason")
+                }
+            )
+            if any("gdal_translate was not found" in reason for reason in reasons):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Processing environment is not configured: "
+                        "gdal_translate with HDF4 support was not found. "
+                        "Install GDAL (OSGeo4W or conda-forge) and put it on PATH, "
+                        "or set the GDAL_TRANSLATE environment variable to its full path."
+                    ),
+                ) from exc
+
+            detail = f"No valid observations: {exc}"
+            if reasons:
+                detail += f" Reasons: {'; '.join(reasons[:3])}"
+            raise HTTPException(status_code=404, detail=detail) from exc
 
         data_quality = {
             "observation_count": int(validation["summary"].get("observation_count", 0)),

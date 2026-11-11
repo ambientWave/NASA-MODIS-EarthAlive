@@ -1,6 +1,6 @@
 I read every module, both docs, and all five test files in D:\assignments\backend\backend. Here's what the codebase actually is, how work flows through it, the conventions worth copying, and where I'd optimize.
 What it is
-A single FastAPI backend for "Earth Alive" — a NASA Earth-science analysis platform. It fetches MOD11A1 (MODIS daily land-surface temperature) granules from NASA Earthdata, mosaics/crops them to a user AOI, builds a temperature time series, and runs trend statistics on it. There's a Flutter client implied (the CORS comment), but no code for it here. The parent folder also holds EALive/backend, a byte-identical duplicate of this tree (I hashed the key files) that is the only place pytest.ini exists.
+A single FastAPI backend for "Earth Alive" — a NASA Earth-science analysis platform. It fetches MOD11A1 (MODIS daily land-surface temperature) granules from NASA Earthdata, mosaics/crops them to a user AOI, builds a temperature time series, and runs trend statistics on it. There's a Flutter client implied (the CORS comment), but no code for it here. The sibling `EALive/` tree belongs to a different codebase from another machine and is not part of this project.
 app/
   main.py                     app + CORS + router mounting
   api/routes/{health,variables,analysis}.py
@@ -55,7 +55,7 @@ Scale / robustness — the big one
 Hygiene
 - requirements.txt omits rasterio (imported in two modules), pytest, and httpx; pins nothing; GDAL is an undocumented system dependency.
 - No pyproject.toml/conftest.py/pytest.ini; the import shims (try: from app... except ModuleNotFoundError: from backend.app...) are copy-pasted into three modules to paper over the missing package install.
-- Two identical copies of the whole codebase (backend/backend and EALive/backend).
+- (The sibling `EALive/` tree is from a different codebase and is out of scope.)
 - modis_downloader.py is dead duplicate code; raster_processor.py is a legacy script with hardcoded paths, Arabic comments, and plt.show().
 - allow_origins=["*"], no auth, no rate limiting, no Dockerfile.
 - Pydantic v2 deprecated example= in Field; response models are dict[str, Any], so OpenAPI documents nothing and the client contract is informal.
@@ -93,7 +93,7 @@ Verified: app imports from both roots, `GET /api/v1/health/` returns 200.
 
 ### Added `README.md`
 
-A full reference for the project: stack, layout, quick start, API reference, architecture, workflows, both record schemas, extension conventions and recipes, configuration/data directories, testing matrix, known issues (correctness, scale, hygiene), a P0–P3 optimization roadmap, and repository hazards (the byte-identical `EALive/backend` copy, run-location ambiguity, no VCS).
+A full reference for the project: stack, layout, quick start, API reference, architecture, workflows, both record schemas, extension conventions and recipes, configuration/data directories, testing matrix, known issues (correctness, scale, hygiene), a P0–P3 optimization roadmap, and repository hazards (run-location ambiguity, VCS state).
 
 ---
 
@@ -198,10 +198,145 @@ Note: the rewrite of `app/main.py` also dropped the unversioned `/health` alias,
 
 ---
 
+## 2026-11-11 — Diagnosed the "No valid observations" trend failure
+
+`POST /api/v1/analysis/trend` returned `404 {"detail":"No valid observations: No valid non-missing observations remain for statistical analysis."}`. The saved series `data/processed/time_series/trend_api_modis_timeseries_daily.json` had 31 January records, all `missing_observation: true` with `valid_pixels: 0` and `granules_used: []`.
+
+Root cause: **`gdal_translate` was not available to the server**, so HDF4 extraction failed for every granule. Reproducing one granule directly gave:
+
+```text
+warnings: ['Could not process MOD11A1.A2024001.h20v06.061.2024005035508.hdf: [WinError 2] The system cannot find the file specified']
+```
+
+`process_aoi_for_date` caught that `FileNotFoundError`, returned `valid_pixels=0`, and `collect_mod11a1_timeseries` then replaced the detailed record with a generic `build_missing_observation_record(..., "No valid pixels after QA filtering.")`. The actual cause was therefore invisible in both the JSON artifacts and the API response.
+
+Changes:
+
+- `app/services/modis_processor.py`: added `find_gdal_translate()` (checks `GDAL_TRANSLATE`, then `PATH`) and an actionable `RuntimeError` when GDAL is absent; `extract_subdataset_to_tiff` now uses it.
+- `app/services/modis_timeseries.py`: `collect_mod11a1_timeseries` fails fast before downloading when GDAL is missing; `build_missing_observation_record` now preserves `warnings`, `granules_used`, and `total_pixels`, and the collector passes the real per-granule warnings into `missing_reason`.
+- `app/api/routes/analysis.py`: maps a missing-GDAL `RuntimeError` to `503` with installation guidance; otherwise includes the distinct `missing_reason` values in the `404` detail.
+
+Verified against the running server:
+
+```text
+HTTP 503
+{"detail":"Processing environment is not configured: gdal_translate was not found. ..."}
+```
+
+Tests added: environment override for `GDAL_TRANSLATE`, actionable error when GDAL is missing, warning/granule preservation in missing records, `503` for missing GDAL, and `404` reasons for an all-missing series. Suite: **61 passed, 2 failed, 3 deselected** (the two remaining failures are the artifact-dependent `test_modis_validation.py` cases).
+
+Note: a prior run in the sibling `EALive` tree (a different codebase) produced valid January values (e.g. 23.40 °C on 2024-01-01) with the same QA logic, so no QA or scaling change was needed here.
+
+---
+
+## 2026-11-11 — Docker Compose dev container
+
+Added a containerized dev setup, requested as a Compose file on `python:3.14-alpine` that installs `requirements.txt` and runs `uvicorn app.main:app --reload`.
+
+Files:
+
+- `Dockerfile` — `python:3.14-alpine`; installs `gdal`/`gdal-tools` plus build dependencies, installs the pinned requirements, and defaults to `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`. The working directory is `/srv/backend/backend` so the project-rooted paths (`.parents[3]` in `modis_processor.py`) resolve to `/srv/backend/data`, matching the host layout `backend/backend` under `backend/`.
+- `docker-compose.yml` — builds the image, publishes `8000:8000`, injects `.env` via `env_file` (optional), bind-mounts `./app` for reload and `./data` for artifacts, sets `WATCHFILES_FORCE_POLLING=true` for Docker Desktop bind mounts, and health-checks `/api/v1/health/`.
+- `.dockerignore` — excludes `.env`, `data/`, caches, tests, and docs from the build context.
+
+Checked with `docker compose config --quiet` (passes). The image was **not built** because the Docker Desktop daemon was not running in this session.
+
+Caveats recorded:
+
+- `requirements.txt` is UTF-16 LE (from `pip freeze` in PowerShell). pip's requirements parser detects the BOM, so it works as-is in the image.
+- Alpine's `gdal` has **no HDF4 driver**, so MOD11A1 `.hdf` extraction will fail in this image. `gdal_translate` exists, so the failure surfaces as a `404` with the gdal format error rather than the missing-binary `503`.
+
+---
+
+## 2026-11-11 — Docker base switched to conda-forge GDAL (HDF4)
+
+The Alpine image could not process MOD11A1: Alpine's `gdal` package has no **HDF4** driver, so `gdal_translate` rejects HDF4-EOS granules.
+
+Replaced `FROM python:3.14-alpine` with `mambaorg/micromamba:2.10.0-debian13-slim`, then install from conda-forge:
+
+```dockerfile
+RUN micromamba install -y -n base -c conda-forge \
+        python=3.14 pip gdal libgdal-hdf4
+```
+
+Why this combination:
+
+- `libgdal-hdf4` (GDAL ≥ 3.9.1 plugin) is the supported way to get HDF4/HDF4-EOS from conda-forge.
+- Debian/Ubuntu do not package an HDF4-enabled GDAL (`libgdal-hdf4` does not exist there), so `python:3.14-slim` was not an option without a source build.
+- The micromamba Debian-slim base is smaller than the miniforge/conda base images, while still giving a conda-forge GDAL.
+
+Other changes:
+
+- Build now asserts HDF4 support: `gdalinfo --formats | grep -qi hdf4` (and `gdal_translate --version`), so a bad GDAL fails the build rather than a request.
+- `GDAL_TRANSLATE=/opt/conda/bin/gdal_translate` is set in the image and in Compose.
+- The `/srv/backend/backend` workdir and `./data:/srv/backend/data` mount are unchanged, so project-rooted paths still resolve correctly.
+- `.dockerignore` still excludes `.env`, `data/`, tests, and docs.
+
+`docker compose config --quiet` passes. The image was still not built here because the Docker Desktop daemon is not running, so the conda/pip install itself is unverified.
+
+### Fix: exit 127 during the first build attempt
+
+The first real build failed on the `micromamba install ... && gdal_translate --version` step with exit code **127** (command not found). Cause: the micromamba image sets `SHELL ["/usr/local/bin/_dockerfile_shell.sh"]`, and that wrapper only activates the conda environment when `MAMBA_DOCKERFILE_ACTIVATE=1`. Without it, `/opt/conda/bin` is never added to `PATH`, so `gdal_translate`/`gdalinfo` are not found even though the install succeeded.
+
+Applied:
+
+- `ARG MAMBA_DOCKERFILE_ACTIVATE=1` before the install `RUN`.
+- Explicit `ENV PATH=/opt/conda/bin:$PATH` so pip and uvicorn resolve without relying on the entrypoint.
+- Build-time HDF4 assertion kept (`gdalinfo --formats | grep -qi hdf4`).
+
+### Python version correction
+
+The micromamba-based image was rejected after inspection showed the interpreter was not Python 3.14 (reported as 3.10): installing conda's `gdal` package makes conda choose the Python build, and the version that lands in the image is whatever the solver picks among the package's ABI builds — not something the Dockerfile should leave implicit.
+
+Replaced the micromamba base with `python:3.14.10-slim-trixie` (official image, pinned patch level) and installed only GDAL's non-Python parts:
+
+```dockerfile
+RUN micromamba create -y -p /opt/gdal -c conda-forge --no-pyc \
+        libgdal-core libgdal-hdf4
+```
+
+- `libgdal-core` has no Python dependency and ships `gdal_translate`/`gdalinfo`.
+- `libgdal-hdf4` adds the HDF4/HDF4-EOS plugin (depends on `libgdal-core` + `hdf4`).
+- micromamba itself is a 19 MB static binary downloaded for the build step and deleted afterwards.
+- Build assertions: `python --version | grep -q 3.14`, `gdal_translate --version`, and `gdalinfo --formats | grep -qi hdf4`.
+
+This also shrinks the image versus installing conda's Python stack: the official Python 3.14 slim layer replaces conda's Python/openssl/sqlite/etc., and `/opt/gdal` contains only the GDAL runtime and its dependencies.
+
+`GDAL_TRANSLATE` now points at `/opt/gdal/bin/gdal_translate` in both the image and Compose.
+
+### Build attempt 2: exit 141 (SIGPIPE), and a stale Dockerfile
+
+The next reported failure still showed the superseded `micromamba install -n base ... gdal` step, with exit code **141**. Two separate things:
+
+1. **141 = 128 + 13 = SIGPIPE.** The micromamba image's `SHELL` wrapper runs with `set -ef -o pipefail`, so `gdalinfo --formats | grep -qi hdf4` fails the pipeline: `grep -q` exits as soon as it matches, `gdalinfo` is killed by SIGPIPE, and `pipefail` propagates 141. Ironically this only happens when HDF4 *is* present. Fixed by writing the output to a file and grepping the file (`gdalinfo --formats > /tmp/gdal-formats.txt && grep -qi hdf4 ...`), and doing the same for `python --version`.
+2. **The pasted step does not exist in the current Dockerfile.** The file on disk is the `python:3.14.10-slim-trixie` + `micromamba create -p /opt/gdal ... libgdal-core libgdal-hdf4` version (only Dockerfile under `D:\assignments\backend`). The output therefore came from a build started before the rewrite; a rebuild picks up the new file.
+
+Rebuild with `docker compose build --no-cache` from `D:\assignments\backend\backend`.
+
+## 2026-11-11 — Container runtime: missing `libexpat.so.1`
+
+The container started but crashed while importing rasterio:
+
+```text
+ImportError: libexpat.so.1: cannot open shared object file: No such file or directory
+```
+
+Cause: `rasterio` ships a manylinux wheel, and `libexpat` is on the manylinux policy allowlist, so auditwheel does not bundle it — the distro must provide it. The official `python:3.14-slim-trixie` runtime image keeps only libraries actually linked by its own Python build and does not guarantee `libexpat1`.
+
+Fix: install the allowlisted shared libraries explicitly:
+
+```dockerfile
+apt-get install -y --no-install-recommends curl libexpat1 libgomp1
+```
+
+`libgomp1` is installed for the same reason (`libgomp.so.1` is allowlisted and required by SciPy/OpenBLAS-backed wheels). Debian's `libstdc++6`/`libgcc-s1` are already present, and wheels bundle everything else they need.
+
+---
+
 ## Known follow-ups from this work
 
-- **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `pyhdf`-based reader.
+- **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. The API now returns `503` with that guidance instead of `404` "no valid observations".
 - The two artifact-dependent tests should move under the `integration` marker (or skip when the files are absent).
-- The duplicate `EALive/backend` tree still exists and is byte-identical; pick a canonical copy.
+- The sibling `EALive/` tree is a separate codebase from another machine; ignore it rather than keeping it in sync.
 - The unversioned `/health` alias was removed by the `app/main.py` rewrite; decide whether to restore it for external probes or keep only `/api/v1/health/`.
 - The P0–P3 roadmap in `README.md` is unchanged: unify orchestration, preserve missing periods, fix artifact collisions, then async jobs and guards.

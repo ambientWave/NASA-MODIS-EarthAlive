@@ -34,6 +34,38 @@ def test_missing_observation_record_keeps_date_and_nulls():
     assert record["missing_reason"] == "No granules found"
 
 
+def test_missing_observation_record_keeps_warnings_and_granules():
+    record = build_missing_observation_record(
+        "2024-01-02",
+        "Could not process granule: gdal_translate was not found.",
+        warnings=["Could not process a.hdf: gdal_translate was not found.", "duplicate"],
+        granules_used=["a.hdf"],
+        total_pixels=1000,
+    )
+
+    assert record["missing_reason"].startswith("Could not process granule")
+    assert record["warnings"] == ["Could not process a.hdf: gdal_translate was not found.", "duplicate"]
+    assert record["granules_used"] == ["a.hdf"]
+    assert record["total_pixels"] == 1000
+
+
+def test_find_gdal_translate_prefers_environment_override(monkeypatch):
+    from app.services import modis_processor
+
+    monkeypatch.setenv("GDAL_TRANSLATE", r"C:\custom\gdal_translate.exe")
+    assert modis_processor.find_gdal_translate() == r"C:\custom\gdal_translate.exe"
+
+
+def test_find_gdal_translate_raises_actionable_error_when_missing(monkeypatch):
+    from app.services import modis_processor
+
+    monkeypatch.delenv("GDAL_TRANSLATE", raising=False)
+    monkeypatch.setattr(modis_processor.shutil, "which", lambda name: None)
+
+    with pytest.raises(RuntimeError, match="GDAL_TRANSLATE"):
+        modis_processor.find_gdal_translate()
+
+
 def test_summarize_temperature_array_counts_valid_pixels_only():
     array = np.array(
         [

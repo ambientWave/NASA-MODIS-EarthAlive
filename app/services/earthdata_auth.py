@@ -26,6 +26,7 @@ def ensure_earthaccess_auth(persist: bool = False) -> Any:
 
     try:
         auth = earthaccess.login(strategy=strategy, persist=persist)
+        print(auth)
     except Exception as exc:
         raise ConnectionError(
             f"NASA Earthdata authentication failed using the '{strategy}' strategy: {exc}"

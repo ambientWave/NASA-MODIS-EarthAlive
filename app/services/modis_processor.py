@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -76,14 +78,35 @@ def download_mod11a1_granules(granules: list[Any], target_dir: str | Path | None
     return [Path(path) for path in paths]
 
 
+GDAL_TRANSLATE_ENV_VAR = "GDAL_TRANSLATE"
+
+
+def find_gdal_translate() -> str:
+    """Return the gdal_translate executable to use for HDF4 extraction.
+
+    Checks the ``GDAL_TRANSLATE`` environment variable first, then ``PATH``.
+    Raises ``RuntimeError`` with an actionable message when GDAL is unavailable,
+    so callers report a configuration problem instead of a generic QA failure.
+    """
+    candidate = os.environ.get(GDAL_TRANSLATE_ENV_VAR) or shutil.which("gdal_translate")
+    if not candidate:
+        raise RuntimeError(
+            "gdal_translate was not found. MOD11A1 HDF4 subdatasets need GDAL built with "
+            "the HDF4 driver (for example the OSGeo4W or conda-forge 'gdal' package). "
+            f"Install it, add it to PATH, or set {GDAL_TRANSLATE_ENV_VAR} to the full executable path."
+        )
+    return candidate
+
+
 def extract_subdataset_to_tiff(hdf_path: str | Path, subdataset_name: str, output_tif: str | Path) -> Path:
+    gdal_translate = find_gdal_translate()
     hdf_path = str(hdf_path)
     output_tif = Path(output_tif)
     output_tif.parent.mkdir(parents=True, exist_ok=True)
     gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":MODIS_Grid_Daily_1km_LST:{subdataset_name}'
     subprocess.run(
         [
-            "gdal_translate",
+            gdal_translate,
             "-of",
             "GTiff",
             "-co",

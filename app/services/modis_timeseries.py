@@ -19,6 +19,7 @@ from app.services.modis_processor import (
         download_mod11a1_granules,
         ensure_earthaccess_auth,
         extract_subdataset_to_tiff,
+        find_gdal_translate,
         mandatory_qa_mask,
         read_raster,
         reproject_to_4326,
@@ -158,19 +159,27 @@ def date_range(start_date: str | date | datetime, end_date: str | date | datetim
     return dates
 
 
-def build_missing_observation_record(observation_date: str, reason: str) -> dict[str, Any]:
+def build_missing_observation_record(
+    observation_date: str,
+    reason: str,
+    *,
+    warnings: Iterable[str] | None = None,
+    granules_used: Iterable[str] | None = None,
+    total_pixels: int = 0,
+) -> dict[str, Any]:
     return {
         "observation_date": observation_date,
         "mean_temperature_celsius": None,
         "minimum_temperature_celsius": None,
         "maximum_temperature_celsius": None,
         "valid_pixels": 0,
-        "total_pixels": 0,
+        "total_pixels": int(total_pixels),
         "valid_data_percentage": 0.0,
         "missing_observation": True,
         "missing_reason": reason,
-        "granules_used": [],
+        "granules_used": list(granules_used or []),
         "coverage_status": "missing",
+        "warnings": list(dict.fromkeys(warnings or [])),
     }
 
 
@@ -345,6 +354,9 @@ def save_timeseries_outputs(records: list[dict[str, Any]], output_dir: str | Pat
 def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Fail fast when GDAL is unavailable, instead of recording every date as
+    # "no valid pixels" and downloading granules that cannot be processed.
+    find_gdal_translate()
     ensure_earthaccess_auth()
 
     cache = GranuleCache(config.cache_path)
@@ -379,7 +391,16 @@ def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
         }
 
         if summary.get("valid_pixels", 0) == 0:
-            records.append(build_missing_observation_record(date_str, "No valid pixels after QA filtering."))
+            reason = "; ".join(dict.fromkeys(warnings)) or "No valid pixels after QA filtering."
+            records.append(
+                build_missing_observation_record(
+                    date_str,
+                    reason,
+                    warnings=warnings,
+                    granules_used=summary.get("granules_used", []),
+                    total_pixels=int(summary.get("total_pixels", 0) or 0),
+                )
+            )
         else:
             records.append(obs_record)
 

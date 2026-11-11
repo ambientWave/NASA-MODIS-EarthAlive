@@ -72,11 +72,14 @@ backend/backend/
 │   ├── test_modis_validation.py      # QA mask / conversion / artifact validation
 │   └── test_global_aoi.py            # multi-region pipeline tests + integration
 ├── .env.example                      # Earthdata credential template
+├── Dockerfile                        # Python 3.14 slim + conda-forge GDAL (HDF4)
+├── docker-compose.yml                # uvicorn --reload with bind mounts
+├── .dockerignore
 ├── requirements.txt
 └── README.md
 ```
 
-There is **no** `pyproject.toml`, `pytest.ini`, `conftest.py`, `Dockerfile`, `.env`, or `.gitignore`.
+There is **no** `pyproject.toml` or `conftest.py`; `pytest.ini`, `.env`, `.gitignore`, `Dockerfile`, and `docker-compose.yml` now exist.
 
 ---
 
@@ -90,7 +93,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-GDAL must also be available on `PATH` (the pipeline shells out to `gdal_translate`).
+GDAL must also be available on `PATH` (the pipeline shells out to `gdal_translate`). The build must include the **HDF4** driver, because MOD11A1 granules are HDF4-EOS files; the `rasterio` wheel bundles GDAL but not HDF4. Use the `gdal` package from conda-forge or OSGeo4W. If it is installed somewhere off `PATH`, set `GDAL_TRANSLATE` to the full executable path:
+
+```powershell
+$env:GDAL_TRANSLATE = "C:\OSGeo4W\bin\gdal_translate.exe"
+```
+
+Without GDAL, `POST /api/v1/analysis/trend` returns `503` naming `gdal_translate` instead of a misleading "no valid observations" error.
 
 ### 2. Configure NASA Earthdata credentials
 
@@ -124,6 +133,22 @@ uvicorn app.main:app --reload
 
 - Docs: <http://127.0.0.1:8000/docs>
 - Health: <http://127.0.0.1:8000/api/v1/health/>
+
+### 3b. Run the API in Docker
+
+`Dockerfile` and `docker-compose.yml` run the app on `python:3.14-slim-trixie` with the pinned `requirements.txt` and a conda-forge GDAL that includes the **HDF4** driver, then run `uvicorn --reload`:
+
+```powershell
+docker compose up --build
+```
+
+- `./app` is bind-mounted for reload; `./data` is bind-mounted so downloads and artifacts persist on the host.
+- `.env` is injected through `env_file` (missing file is tolerated).
+- Health is polled through `curl` against `/api/v1/health/`.
+- The image mirrors the local layout (`/srv/backend/backend/app`) so project-rooted data paths resolve to `/srv/backend/data`.
+- The build asserts HDF4 support with `gdalinfo --formats | grep -qi hdf4`, so a broken GDAL fails the build instead of at request time.
+
+**Why this split:** Alpine's `gdal` has no HDF4 driver, and Debian/Ubuntu package no HDF4-enabled GDAL (`libgdal-hdf4` does not exist there). Installing conda's `gdal` package would drag in conda's own Python, whose version is decided by the solver. So the image takes Python 3.14 from the official image and installs only `libgdal-core` + `libgdal-hdf4` from conda-forge — no Python dependency, no version substitution.
 
 ### 4. Run the tests
 
@@ -432,7 +457,7 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 - No packaging (`pyproject.toml`); the `try: from app... except ModuleNotFoundError: from backend.app...` shim is copy-pasted across route and service modules. It now re-raises unrelated missing packages, but the duplication remains.
 - `modis_downloader.py` is dead duplicate code.
 - Path handling is now centralized in `app/utils/paths.py` for the raster CLI and MODIS outputs, but `statistical_analysis`/`modis_timeseries` still build some artifact paths inline instead of going through the helpers.
-- `allow_origins=["*"]`, no authentication, no rate limiting, no Dockerfile.
+- `allow_origins=["*"]`, no authentication, no rate limiting.
 - Pydantic v2 deprecated `example=` in `Field`; use `json_schema_extra`.
 - `__pycache__` artifacts sit in the tree; no `.gitignore`.
 - The `integration` marker is registered in `pytest.ini`, but it is not in `addopts`, so network tests still run by default unless you pass `-m "not integration"`.
@@ -472,7 +497,7 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 1. Structured logging with request/job IDs.
 2. Environment-based settings: `DATA_DIR`, `MAX_AOI_AREA`, `MAX_RANGE_DAYS`, `CACHE_TTL`.
 3. CORS allowlist, API key or rate limiting for public deployment.
-4. Docker image with GDAL and pinned dependencies; CI that runs `-m "not integration"`.
+4. Dev image exists (`Dockerfile` + `docker-compose.yml`, conda-forge GDAL with HDF4); add a production image (multi-stage, non-root, no `--reload`) and CI that runs `-m "not integration"`.
 5. Cache analysis results keyed by `(product, aoi, start, end, resolution, methods)`.
 6. Parallelize tile processing with a process pool once memory is bounded.
 
@@ -482,9 +507,9 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 
 ## Repository hazards
 
-- **Duplicate codebase:** `D:\assignments\backend\EALive\backend` is a byte-identical copy of this tree (verified by hashing `main.py`, `analysis.py`, `modis_timeseries.py`, `statistical_analysis.py`, `modis_processor.py`). It also contains the only `pytest.ini` and a populated `data/` directory. Edits in one copy do not propagate to the other. Decide which is canonical and remove or archive the other.
+- **Leave sibling trees alone:** `D:\assignments\backend\EALive\` belongs to a different codebase from another machine. It is out of scope for this project; do not treat it as a copy, do not sync changes with it, and do not edit it.
 - **Run location matters:** tests import `app.*` and run from `D:\assignments\backend\backend`; the `try: from app... except ModuleNotFoundError: from backend.app...` shims still allow importing from the parent directory. Packaging will remove this ambiguity.
-- **No VCS:** this directory is not a git repository. There is no way to diff changes or recover overwritten work.
+- **VCS:** this directory is a git repository, so `git status`/`git diff` are the source of truth for what changed.
 
 ---
 
