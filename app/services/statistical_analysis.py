@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+from app.utils.encoding import encode_bytes_base64
+from app.utils.logging import log
 
 
 DEFAULT_ANALYSIS_DIR = Path(__file__).resolve().parents[3] / "data" / "processed" / "analysis"
@@ -697,6 +701,293 @@ def generate_analysis_visualizations(
     plt.close(fig3)
 
     return {"time_series": str(time_series_path), "trend": str(trend_path), "missing": str(missing_path)}
+
+
+def _figure_to_visualization(fig: Any) -> dict[str, str]:
+    """Encode an open matplotlib figure as a base64 PNG object and close it."""
+    buffer = io.BytesIO()
+    try:
+        fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+        return {"content_type": "image/png", "base64": encode_bytes_base64(buffer.getvalue())}
+    finally:
+        plt.close(fig)
+
+
+def _format_metric(value: Any, digits: int = 4) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{digits}g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _series_dataframe(records: Iterable[dict[str, Any]]) -> pd.DataFrame:
+    validated = validate_time_series(records)
+    return validated["dataframe"].copy().sort_values("observation_date").reset_index(drop=True)
+
+
+def _render_series_with_annotation(
+    df: pd.DataFrame,
+    title: str,
+    annotation_lines: Iterable[str],
+    ylabel: str = "Mean LST (°C)",
+) -> dict[str, str]:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(df["observation_date"], df["mean_lst"], marker="o", linewidth=1.8, color="tab:blue")
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel(ylabel)
+    fig.autofmt_xdate()
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(line for line in annotation_lines if line),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+    )
+    fig.tight_layout()
+    return _figure_to_visualization(fig)
+
+
+def _render_linear_regression(
+    df: pd.DataFrame,
+    result: dict[str, Any],
+    aoi: dict[str, float],
+    product: str,
+) -> dict[str, str]:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = (df["observation_date"] - df["observation_date"].min()).dt.total_seconds() / (365.25 * 86400.0)
+    slope = result.get("slope_celsius_per_year")
+    intercept = result.get("intercept_celsius")
+    ax.plot(df["observation_date"], df["mean_lst"], marker="o", label="Observed", color="tab:blue")
+    if slope is not None and intercept is not None:
+        fit_x = np.linspace(float(x.min()), float(x.max()), 100)
+        fit_y = float(slope) * fit_x + float(intercept)
+        fit_dates = df["observation_date"].min() + pd.to_timedelta(fit_x * 365.25, unit="D")
+        ax.plot(fit_dates, fit_y, color="tab:red", linewidth=2, label="Linear fit")
+    ax.set_title(f"{product} LST Linear Regression — AOI {aoi}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Mean LST (°C)")
+    ax.legend(loc="best")
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(
+            [
+                f"slope: {_format_metric(slope)} °C/year",
+                f"p-value: {_format_metric(result.get('p_value'))}",
+                f"R²: {_format_metric(result.get('r_squared'))}",
+                f"n: {result.get('n', len(df))}",
+            ]
+        ),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+    )
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return _figure_to_visualization(fig)
+
+
+def _render_mann_kendall(
+    df: pd.DataFrame,
+    result: dict[str, Any],
+    product: str,
+    label: str,
+) -> dict[str, str]:
+    return _render_series_with_annotation(
+        df,
+        f"{product} LST {label} — AOI",
+        [
+            f"trend: {result.get('trend_direction', 'n/a')}",
+            f"S: {_format_metric(result.get('s_statistic'))}",
+            f"tau: {_format_metric(result.get('kendall_tau'))}",
+            f"p-value: {_format_metric(result.get('p_value'))}",
+            f"n: {result.get('n', len(df))}",
+        ],
+    )
+
+
+def _render_modified_mann_kendall(
+    df: pd.DataFrame,
+    result: dict[str, Any],
+    product: str,
+) -> dict[str, str]:
+    details = result.get("modified_mann_kendall") or result.get("standard_mann_kendall") or {}
+    return _render_series_with_annotation(
+        df,
+        f"{product} LST Modified Mann-Kendall — AOI",
+        [
+            f"status: {result.get('status', 'n/a')}",
+            f"method: {result.get('selected_method', details.get('method', 'n/a'))}",
+            f"trend: {details.get('trend_direction', 'n/a')}",
+            f"tau: {_format_metric(details.get('kendall_tau'))}",
+            f"p-value: {_format_metric(details.get('p_value'))}",
+            f"autocorrelation: {_format_metric(result.get('autocorrelation_coefficient'))}",
+        ],
+    )
+
+
+def _render_seasonal_mann_kendall(
+    df: pd.DataFrame,
+    result: dict[str, Any],
+    product: str,
+) -> dict[str, str]:
+    if result.get("status") == "calculated":
+        monthly_means = df.groupby(df["observation_date"].dt.month)["mean_lst"].mean()
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(monthly_means.index.astype(int), monthly_means.to_numpy(), color="tab:green")
+        ax.set_title(f"{product} LST Seasonal Mann-Kendall — monthly means")
+        ax.set_xlabel("Calendar month")
+        ax.set_ylabel("Mean LST (°C)")
+        ax.set_xticks(range(1, 13))
+        ax.text(
+            0.02,
+            0.98,
+            "\n".join(
+                [
+                    f"trend: {result.get('trend_direction', 'n/a')}",
+                    f"combined S: {_format_metric(result.get('combined_s'))}",
+                    f"p-value: {_format_metric(result.get('p_value'))}",
+                    f"months: {result.get('n_months', len(monthly_means))}",
+                ]
+            ),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+        )
+        fig.tight_layout()
+        return _figure_to_visualization(fig)
+
+    return _render_series_with_annotation(
+        df,
+        f"{product} LST Seasonal Mann-Kendall — AOI",
+        [
+            f"status: {result.get('status', 'n/a')}",
+            str(result.get("reason") or result.get("insufficient_data_reason") or ""),
+        ],
+    )
+
+
+def _render_t_test(
+    df: pd.DataFrame,
+    result: dict[str, Any],
+    product: str,
+) -> dict[str, str]:
+    period_a = result.get("period_a")
+    period_b = result.get("period_b")
+    if not period_a or not period_b:
+        return _render_series_with_annotation(
+            df,
+            f"{product} LST Period Comparison — AOI",
+            [f"status: {result.get('status', 'insufficient_data')}", str(result.get("reason") or "")],
+        )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    labels = [
+        f"Early\n{period_a.get('start')} to {period_a.get('end')}",
+        f"Late\n{period_b.get('start')} to {period_b.get('end')}",
+    ]
+    means = [float(period_a.get("mean", 0.0)), float(period_b.get("mean", 0.0))]
+    ax.bar(labels, means, color=["tab:blue", "tab:orange"])
+    ax.set_title(f"{product} LST Period Comparison — AOI")
+    ax.set_ylabel("Mean LST (°C)")
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(
+            [
+                f"difference: {_format_metric(result.get('mean_difference_celsius'))} °C",
+                f"p-value: {_format_metric(result.get('p_value'))}",
+                f"effect size: {_format_metric(result.get('effect_size_cohens_d'))}",
+            ]
+        ),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+    )
+    fig.tight_layout()
+    return _figure_to_visualization(fig)
+
+
+def _render_heatmap(
+    array: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    product: str,
+    aoi: dict[str, float],
+) -> dict[str, str]:
+    fig, ax = plt.subplots(figsize=(10, 8))
+    masked = np.ma.masked_invalid(np.asarray(array, dtype=np.float32))
+    image = ax.imshow(
+        masked,
+        cmap="inferno",
+        origin="upper",
+        extent=[bounds[0], bounds[2], bounds[1], bounds[3]],
+    )
+    fig.colorbar(image, ax=ax, label="Mean temperature (°C)")
+    ax.set_title(f"{product} Mean LST Heatmap — AOI {aoi}")
+    ax.set_xlabel("Longitude (°)")
+    ax.set_ylabel("Latitude (°)")
+    fig.tight_layout()
+    return _figure_to_visualization(fig)
+
+
+def generate_trend_visualizations(
+    records: Iterable[dict[str, Any]],
+    analysis_results: dict[str, Any],
+    aoi: dict[str, float],
+    product: str,
+    mean_raster: np.ndarray | None = None,
+    raster_bounds: tuple[float, float, float, float] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Build the trend response ``visualizations`` mapping.
+
+    Each key is the figure name (``heatmap`` or an analysis method name) and
+    each value contains the PNG bytes encoded as base64. Figures that cannot be
+    produced are omitted instead of failing the whole analysis request.
+    """
+    visualizations: dict[str, dict[str, str]] = {}
+
+    if mean_raster is not None and raster_bounds is not None:
+        try:
+            visualizations["heatmap"] = _render_heatmap(mean_raster, raster_bounds, product, aoi)
+        except Exception as exc:  # pragma: no cover - rendering guard
+            log(f"visualizations: could not render heatmap: {type(exc).__name__}: {exc}")
+
+    try:
+        df = _series_dataframe(records)
+    except ValueError as exc:
+        log(f"visualizations: could not prepare series: {exc}")
+        return visualizations
+
+    renderers = {
+        "linear_regression": lambda result: _render_linear_regression(df, result, aoi, product),
+        "mann_kendall": lambda result: _render_mann_kendall(df, result, product, "Mann-Kendall"),
+        "modified_mann_kendall": lambda result: _render_modified_mann_kendall(df, result, product),
+        "seasonal_mann_kendall": lambda result: _render_seasonal_mann_kendall(df, result, product),
+        "t_test": lambda result: _render_t_test(df, result, product),
+    }
+
+    for method, result in analysis_results.items():
+        renderer = renderers.get(method)
+        if renderer is None or not isinstance(result, dict):
+            continue
+        try:
+            visualizations[method] = renderer(result)
+        except Exception as exc:  # pragma: no cover - rendering guard
+            log(f"visualizations: could not render '{method}': {type(exc).__name__}: {exc}")
+
+    return visualizations
 
 
 def analyze_time_series(

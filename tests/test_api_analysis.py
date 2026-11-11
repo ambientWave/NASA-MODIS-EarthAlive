@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -51,6 +53,14 @@ def test_analysis_trend_validates_payload_and_returns_results(monkeypatch):
     assert body["metadata"]["product"] == "MOD11A1"
     assert "linear_regression" in body["analysis_results"]
     assert "mann_kendall" in body["analysis_results"]
+
+    visualizations = body["visualizations"]
+    assert set(visualizations) == {"linear_regression", "mann_kendall"}
+    for chart in visualizations.values():
+        assert chart["content_type"] == "image/png"
+        assert "path" not in chart
+        assert "filename" not in chart
+        assert base64.b64decode(chart["base64"]).startswith(b"\x89PNG")
 
 
 def test_analysis_trend_reports_missing_gdal_as_service_unavailable(monkeypatch):

@@ -5,6 +5,7 @@ from typing import Any
 import earthaccess
 
 from app.core.config import get_settings
+from app.utils.logging import log
 
 
 def ensure_earthaccess_auth(persist: bool = False) -> Any:
@@ -25,16 +26,19 @@ def ensure_earthaccess_auth(persist: bool = False) -> Any:
         )
 
     try:
+        log(f"earthdata: logging in with strategy '{strategy}'")
         auth = earthaccess.login(strategy=strategy, persist=persist)
-        print(auth)
     except Exception as exc:
+        log(f"earthdata: login failed with strategy '{strategy}': {exc}")
         raise ConnectionError(
             f"NASA Earthdata authentication failed using the '{strategy}' strategy: {exc}"
         ) from exc
 
     if not getattr(auth, "authenticated", False):
+        log(f"earthdata: login did not authenticate using strategy '{strategy}'")
         raise ConnectionError(
             f"NASA Earthdata authentication failed using the '{strategy}' strategy. "
             "Check your credentials in .env, or use EARTHDATA_TOKEN."
         )
+    log(f"earthdata: authenticated using strategy '{strategy}'")
     return auth

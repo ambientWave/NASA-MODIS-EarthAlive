@@ -25,6 +25,7 @@ from app.services.modis_processor import (
         reproject_to_4326,
         valid_lst_mask,
     )
+from app.utils.logging import log, log_progress
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 TIME_SERIES_DIR = PROCESSED_DATA_DIR / "time_series"
@@ -115,21 +116,25 @@ class GranuleCache:
     def download_missing(self, granules: Iterable[Any], target_dir: str | Path) -> list[Path]:
         target_dir = Path(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+        granule_list = list(granules)
 
         missing_granules: list[Any] = []
-        for granule in granules:
+        for granule in granule_list:
             if not self.is_cached(granule):
                 missing_granules.append(granule)
 
         if not missing_granules:
-            return [Path(self.store[self.granule_identity(granule)]) for granule in granules if self.is_cached(granule)]
+            log(f"timeseries: all {len(granule_list)} granules already cached")
+            return [Path(self.store[self.granule_identity(granule)]) for granule in granule_list if self.is_cached(granule)]
 
+        log(f"timeseries: downloading {len(missing_granules)} granule(s)")
         downloaded = download_mod11a1_granules(missing_granules, target_dir)
+        log(f"timeseries: downloaded {len(downloaded)} granule(s)")
         for granule, path in zip(missing_granules, downloaded):
             self.mark_downloaded(granule, path)
 
         cached_paths: list[Path] = []
-        for granule in granules:
+        for granule in granule_list:
             key = self.granule_identity(granule)
             stored_path = self.store.get(key)
             if stored_path:
@@ -225,6 +230,7 @@ def process_aoi_for_date(
     for hdf_path in granule_files:
         hdf_path = Path(hdf_path)
         if not hdf_path.exists():
+            log(f"timeseries: {date_str}: missing downloaded file {hdf_path.name}")
             warnings.append(f"Missing downloaded file: {hdf_path.name}")
             continue
 
@@ -233,16 +239,19 @@ def process_aoi_for_date(
         qc_tif = Path(output_dir) / f"{hdf_path.stem}_QC_Day.tif"
 
         try:
+            log(f"timeseries: {date_str}: extracting LST/QC from {hdf_path.name}")
             extract_subdataset_to_tiff(hdf_path, "LST_Day_1km", lst_tif)
             extract_subdataset_to_tiff(hdf_path, "QC_Day", qc_tif)
             lst_data, lst_profile = read_raster(lst_tif)
             qc_data, _ = read_raster(qc_tif)
         except Exception as exc:
+            log(f"timeseries: {date_str}: failed to process {hdf_path.name}: {exc}")
             warnings.append(f"Could not process {hdf_path.name}: {exc}")
             continue
 
         valid_mask = valid_lst_mask(lst_data) & mandatory_qa_mask(qc_data)
         if not np.any(valid_mask):
+            log(f"timeseries: {date_str}: no valid pixels after QA for {hdf_path.name}")
             warnings.append(f"No valid MODIS LST pixels after QA filtering for {hdf_path.name}")
             continue
 
@@ -253,6 +262,11 @@ def process_aoi_for_date(
         merged = np.where(np.isfinite(projected), projected, merged)
 
     summary = summarize_temperature_array(merged)
+    log(
+        f"timeseries: {date_str}: processed {len(granule_paths)} granule(s), "
+        f"valid_pixels={summary['valid_pixels']}/{summary['total_pixels']}, "
+        f"mean={summary['mean_temperature_celsius']}"
+    )
     return merged, warnings, {"date": date_str, "granules_used": granule_paths, **summary}
 
 
@@ -356,25 +370,46 @@ def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     # Fail fast when GDAL is unavailable, instead of recording every date as
     # "no valid pixels" and downloading granules that cannot be processed.
-    find_gdal_translate()
+    gdal_translate = find_gdal_translate()
+    log(f"timeseries: using gdal_translate at {gdal_translate}")
+    log(f"timeseries: authenticating with NASA Earthdata")
     ensure_earthaccess_auth()
 
     cache = GranuleCache(config.cache_path)
     date_list = date_range(config.start_date, config.end_date)
     records: list[dict[str, Any]] = []
+    raster_sum: np.ndarray | None = None
+    raster_count: np.ndarray | None = None
+    log(
+        f"timeseries: collecting {len(date_list)} day(s) "
+        f"({config.start_date} -> {config.end_date}, aoi={config.aoi}, "
+        f"aggregation={config.temporal_aggregation})"
+    )
 
-    for date_str in date_list:
+    for index, date_str in enumerate(date_list, start=1):
+        log_progress("timeseries: date", index, len(date_list), date_str)
         granules = discover_mod11a1_granules(date_str=date_str, bbox=config.aoi)
         if not granules:
+            log(f"timeseries: {date_str}: no granules found")
             records.append(build_missing_observation_record(date_str, "No granules found for the AOI on this date."))
             continue
+        log(f"timeseries: {date_str}: found {len(granules)} granule(s)")
 
         downloaded_files = cache.download_missing(granules, output_dir / "raw")
         if not downloaded_files:
+            log(f"timeseries: {date_str}: granules were cached but files are missing")
             records.append(build_missing_observation_record(date_str, "Granules were already cached but files are missing or unreadable."))
             continue
 
         merged, warnings, summary = process_aoi_for_date(date_str, config.aoi, output_dir, downloaded_files)
+        if merged is not None:
+            finite = np.isfinite(merged)
+            if np.any(finite):
+                if raster_sum is None:
+                    raster_sum = np.zeros(merged.shape, dtype=np.float64)
+                    raster_count = np.zeros(merged.shape, dtype=np.int32)
+                raster_sum[finite] += merged[finite]
+                raster_count[finite] += 1
         obs_record = {
             "observation_date": date_str,
             "mean_temperature_celsius": summary.get("mean_temperature_celsius"),
@@ -405,10 +440,20 @@ def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
             records.append(obs_record)
 
     if config.temporal_aggregation != "daily":
+        log(f"timeseries: aggregating {len(records)} daily records to {config.temporal_aggregation}")
         records = aggregate_period_records(records, config.temporal_aggregation)
 
     region_name = config.region_name
+    log(f"timeseries: writing {len(records)} record(s) to {output_dir}")
     output_files = save_timeseries_outputs(records, output_dir, region_name, config.temporal_aggregation)
+    log(f"timeseries: outputs written: {output_files}")
+
+    mean_raster = None
+    if raster_sum is not None and raster_count is not None:
+        mean_raster = np.full(raster_sum.shape, np.nan, dtype=np.float32)
+        valid = raster_count > 0
+        mean_raster[valid] = (raster_sum[valid] / raster_count[valid]).astype(np.float32)
+
     return {
         "region_name": region_name,
         "aoi": config.aoi,
@@ -419,4 +464,11 @@ def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
         "records": records,
         "output_files": output_files,
         "cache_path": str(config.cache_path),
+        "mean_lst_raster": mean_raster,
+        "raster_bounds": (
+            config.aoi["west"],
+            config.aoi["south"],
+            config.aoi["east"],
+            config.aoi["north"],
+        ),
     }

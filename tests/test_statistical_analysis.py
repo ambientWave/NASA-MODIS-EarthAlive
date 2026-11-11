@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from app.services.statistical_analysis import (
     AnalysisConfig,
     analyze_time_series,
+    generate_trend_visualizations,
     linear_regression_analysis,
     mann_kendall_analysis,
     paired_period_t_test,
@@ -273,3 +275,52 @@ def test_tied_values_are_handled_with_correct_assumptions():
     assert "s_statistic" in result
     assert "kendall_tau" in result
     assert result["p_value"] >= 0.0
+
+
+def test_generate_trend_visualizations_uses_figure_names_and_base64_pngs():
+    dates = pd.date_range("2024-01-01", periods=12, freq="MS")
+    records = _make_records(np.linspace(9.0, 15.0, len(dates)), dates.strftime("%Y-%m-%d"))
+    analysis_results = {
+        "linear_regression": linear_regression_analysis(records),
+        "mann_kendall": mann_kendall_analysis(records),
+        "modified_mann_kendall": {
+            "status": "calculated",
+            "selected_method": "Hamed-Rao modified Mann-Kendall",
+            "autocorrelation_coefficient": 0.35,
+            "modified_mann_kendall": {
+                "trend_direction": "increasing",
+                "kendall_tau": 0.5,
+                "p_value": 0.01,
+            },
+        },
+        "seasonal_mann_kendall": {
+            "status": "insufficient_data",
+            "insufficient_data_reason": "Not enough years.",
+        },
+        "t_test": paired_period_t_test(
+            records,
+            ("2024-01-01", "2024-03-31"),
+            ("2024-10-01", "2024-12-31"),
+        ),
+    }
+
+    visualizations = generate_trend_visualizations(
+        records,
+        analysis_results,
+        {"west": 24.7, "south": 22.0, "east": 36.9, "north": 31.7},
+        "MOD11A1",
+        mean_raster=np.ones((4, 4), dtype=np.float32),
+        raster_bounds=(24.7, 22.0, 36.9, 31.7),
+    )
+
+    assert set(visualizations) == {
+        "heatmap",
+        "linear_regression",
+        "mann_kendall",
+        "modified_mann_kendall",
+        "seasonal_mann_kendall",
+        "t_test",
+    }
+    for chart in visualizations.values():
+        assert chart["content_type"] == "image/png"
+        assert base64.b64decode(chart["base64"]).startswith(b"\x89PNG")

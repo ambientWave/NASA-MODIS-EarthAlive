@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -7,7 +8,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.services.modis_timeseries import TimeSeriesConfig, collect_mod11a1_timeseries
+from app.utils.logging import log
 from app.services.statistical_analysis import (
+        generate_trend_visualizations,
         linear_regression_analysis,
         mann_kendall_analysis,
         modified_mann_kendall_analysis,
@@ -167,6 +170,13 @@ def _calculate_t_test(stats_records: list[dict[str, Any]]) -> dict[str, Any]:
     },
 )
 def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    log(
+        "trend: request received "
+        f"product={payload.product} aoi={payload.aoi.model_dump()} "
+        f"start={payload.start_date} end={payload.end_date} "
+        f"resolution={payload.temporal_resolution} methods={payload.analysis_methods}"
+    )
     try:
         product = str(payload.product).upper()
         if product not in SUPPORTED_PRODUCTS:
@@ -211,21 +221,39 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
             region_name="trend_api",
         )
 
+        log(
+            "trend: inputs validated, starting MOD11A1 time series collection "
+            f"(resolution={temporal_resolution}, region={config.region_name})"
+        )
+        collection_started_at = time.perf_counter()
         try:
             time_series_payload = collect_mod11a1_timeseries(config)
         except TimeoutError as exc:
+            log(f"trend: collection timed out after {time.perf_counter() - collection_started_at:.1f}s: {exc}")
             raise HTTPException(status_code=504, detail=f"Processing timeout: {exc}") from exc
         except RuntimeError as exc:
+            log(f"trend: processing environment is not configured: {exc}")
             raise HTTPException(status_code=503, detail=f"Processing environment is not configured: {exc}") from exc
         except (ConnectionError, OSError) as exc:
+            log(f"trend: NASA Earthdata connection failure: {exc}")
             raise HTTPException(status_code=503, detail=f"NASA Earthdata connection failure: {exc}") from exc
         except ValueError as exc:
+            log(f"trend: no NASA data available: {exc}")
             raise HTTPException(status_code=404, detail=f"No NASA data available: {exc}") from exc
+
+        log(
+            "trend: time series collected in "
+            f"{time.perf_counter() - collection_started_at:.1f}s "
+            f"({len(time_series_payload.get('records', []))} records, "
+            f"files={time_series_payload.get('output_files')})"
+        )
 
         records = _as_stats_records(time_series_payload)
         if not records:
+            log("trend: no usable records after transforming the time series")
             raise HTTPException(status_code=404, detail="No valid time series records were returned for the requested AOI and date range.")
 
+        log(f"trend: validating time series ({len(records)} records)")
         try:
             validation = validate_time_series(records)
         except ValueError as exc:
@@ -236,6 +264,7 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
                     if record.get("missing_reason")
                 }
             )
+            log(f"trend: validation failed: {exc} reasons={reasons[:3]}")
             if any("gdal_translate was not found" in reason for reason in reasons):
                 raise HTTPException(
                     status_code=503,
@@ -270,6 +299,8 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
         detected_warnings: list[str] = list(data_quality["warnings"])
 
         for method in requested_methods:
+            method_started_at = time.perf_counter()
+            log(f"trend: running analysis method '{method}'")
             if method == "linear_regression":
                 result = linear_regression_analysis(records)
                 analysis_results[method] = result
@@ -298,6 +329,26 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
                 result = _calculate_t_test(records)
                 analysis_results[method] = result
                 detected_warnings.extend(result.get("warnings", []))
+            log(
+                f"trend: analysis method '{method}' finished in "
+                f"{time.perf_counter() - method_started_at:.2f}s "
+                f"status={analysis_results.get(method, {}).get('status')}"
+            )
+
+        visualizations: dict[str, Any] = {}
+        try:
+            raster_bounds = time_series_payload.get("raster_bounds")
+            visualizations = generate_trend_visualizations(
+                records,
+                analysis_results,
+                aoi,
+                product,
+                mean_raster=time_series_payload.get("mean_lst_raster"),
+                raster_bounds=tuple(raster_bounds) if raster_bounds else None,
+            )
+            log(f"trend: generated {len(visualizations)} visualization(s): {sorted(visualizations)}")
+        except Exception as exc:  # pragma: no cover - visualization is non-critical
+            log(f"trend: visualization generation failed: {type(exc).__name__}: {exc}")
 
         response = {
             "success": True,
@@ -310,18 +361,27 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
             },
             "data_quality": data_quality,
             "analysis_results": analysis_results,
-            "visualizations": {},
+            "visualizations": visualizations,
             "warnings": sorted(set(detected_warnings)),
         }
+        log(
+            f"trend: request completed in {time.perf_counter() - started_at:.1f}s "
+            f"(valid_observations={data_quality['valid_observation_count']}, "
+            f"methods={list(analysis_results)})"
+        )
         return response
 
-    except HTTPException:
+    except HTTPException as exc:
+        log(f"trend: request failed in {time.perf_counter() - started_at:.1f}s with HTTP {exc.status_code}: {exc.detail}")
         raise
     except TimeoutError as exc:
+        log(f"trend: processing timeout after {time.perf_counter() - started_at:.1f}s: {exc}")
         raise HTTPException(status_code=504, detail=f"Processing timeout: {exc}") from exc
     except ConnectionError as exc:
+        log(f"trend: Earthdata connection failure: {exc}")
         raise HTTPException(status_code=503, detail=f"Earthdata connection failure: {exc}") from exc
     except Exception as exc:  # pragma: no cover - defensive fallback
+        log(f"trend: unexpected error after {time.perf_counter() - started_at:.1f}s: {type(exc).__name__}: {exc}")
         raise HTTPException(status_code=500, detail=f"Unexpected analysis error: {exc}") from exc
 
 

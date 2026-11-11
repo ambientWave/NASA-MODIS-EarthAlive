@@ -19,6 +19,7 @@ from rasterio.transform import from_bounds
 from rasterio.warp import reproject
 
 from app.services.earthdata_auth import ensure_earthaccess_auth
+from app.utils.logging import log
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
@@ -67,8 +68,9 @@ def discover_mod11a1_granules(date_str: str = "2024-01-01", bbox: dict[str, floa
         if start_date == date_str and tile_id and tile_id.lower() not in seen:
             seen.add(tile_id.lower())
             filtered.append(granule)
-
-    return sorted(filtered, key=lambda granule: granule_tile_id(granule))
+    result = sorted(filtered, key=lambda granule: granule_tile_id(granule))
+    log(f"modis: {date_str}: discovered {len(search_results)} result(s), kept {len(result)} unique tile(s) for the AOI")
+    return result
 
 
 def download_mod11a1_granules(granules: list[Any], target_dir: str | Path | None = None) -> list[Path]:
@@ -95,6 +97,7 @@ def find_gdal_translate() -> str:
             "the HDF4 driver (for example the OSGeo4W or conda-forge 'gdal' package). "
             f"Install it, add it to PATH, or set {GDAL_TRANSLATE_ENV_VAR} to the full executable path."
         )
+    log(f"modis: gdal_translate candidate: {candidate}")
     return candidate
 
 
@@ -120,6 +123,7 @@ def extract_subdataset_to_tiff(hdf_path: str | Path, subdataset_name: str, outpu
         capture_output=True,
         text=True,
     )
+    log(f"modis: wrote {output_tif.name}")
     return output_tif
 
 
@@ -190,6 +194,7 @@ def generate_heatmap(array: np.ndarray, bounds: tuple[float, float, float, float
 
 def run_modis_egypt_pipeline(date_str: str = "2024-01-01") -> dict[str, Any]:
     ensure_earthaccess_auth()
+    log(f"modis: running daily pipeline for {date_str}")
     granules = discover_mod11a1_granules(date_str=date_str)
     if not granules:
         raise RuntimeError(f"No MOD11A1 granules found for {date_str} over the Egypt bounding box.")
