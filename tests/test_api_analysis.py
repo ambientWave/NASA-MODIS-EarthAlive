@@ -44,7 +44,7 @@ def test_analysis_trend_validates_payload_and_returns_results(monkeypatch):
         "analysis_methods": ["linear_regression", "mann_kendall"],
     }
 
-    response = client.post("/api/analysis/trend", json=payload)
+    response = client.post("/api/v1/analysis/trend", json=payload)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["success"] is True
@@ -64,6 +64,6 @@ def test_analysis_trend_rejects_invalid_aoi_and_dates():
         "analysis_methods": ["linear_regression"],
     }
 
-    response = client.post("/api/analysis/trend", json=payload)
+    response = client.post("/api/v1/analysis/trend", json=payload)
     assert response.status_code == 400
     assert "AOI" in response.json()["detail"] or "start_date" in response.json()["detail"]

@@ -10,27 +10,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-try:
-    from app.services.modis_processor import (
-        PROCESSED_DATA_DIR,
-        RAW_DATA_DIR,
-        convert_kelvin_to_celsius,
-        destination_grid_size,
-        discover_mod11a1_granules,
-        download_mod11a1_granules,
-        ensure_earthaccess_auth,
-        extract_subdataset_to_tiff,
-        mandatory_qa_mask,
-        read_raster,
-        reproject_to_4326,
-        valid_lst_mask,
-    )
-except ModuleNotFoundError as exc:  # pragma: no cover - repo-root compatibility
-    # Only retry when the top-level "app" package itself is not importable.
-    # Missing third-party packages (e.g. rasterio) must not be masked.
-    if exc.name not in {"app", "backend"}:
-        raise
-    from backend.app.services.modis_processor import (
+from app.services.modis_processor import (
         PROCESSED_DATA_DIR,
         RAW_DATA_DIR,
         convert_kelvin_to_celsius,

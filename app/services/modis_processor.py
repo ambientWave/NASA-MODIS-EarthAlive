@@ -16,12 +16,7 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject
 
-try:
-    from app.services.earthdata_auth import ensure_earthaccess_auth
-except ModuleNotFoundError as exc:  # pragma: no cover - repo-root compatibility
-    if exc.name not in {"app", "backend"}:
-        raise
-    from backend.app.services.earthdata_auth import ensure_earthaccess_auth
+from app.services.earthdata_auth import ensure_earthaccess_auth
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"

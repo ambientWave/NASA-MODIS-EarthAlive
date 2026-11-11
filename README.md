@@ -49,18 +49,20 @@ backend/backend/
 │   ├── main.py                       # FastAPI app, CORS, router registration
 │   ├── core/
 │   │   └── config.py                 # .env loading + Earthdata settings
+│   ├── utils/
+│   │   └── paths.py                  # ensure_directory / ensure_parent_directory / require_file
 │   ├── api/
 │   │   └── routes/
 │   │       ├── health.py             # GET /api/v1/health/
 │   │       ├── variables.py          # GET /api/v1/variables/
-│   │       └── analysis.py           # POST /api/analysis/trend
+│   │       └── analysis.py           # POST /api/v1/analysis/trend
 │   └── services/
 │       ├── earthdata_auth.py         # credential-aware Earthdata login (shared)
 │       ├── modis_processor.py        # Earthdata search/download, GDAL, raster helpers, Egypt CLI
 │       ├── modis_timeseries.py       # per-date collection, granule cache, aggregation, CSV/JSON output
 │       ├── statistical_analysis.py   # validation + MK / modified MK / seasonal MK / OLS / HAC / Welch
 │       ├── modis_downloader.py       # DEAD CODE: duplicate of modis_processor search/download
-│       └── raster_processor.py       # LEGACY script: hardcoded paths, not imported by the app
+│       └── raster_processor.py       # QA/heatmap CLI: path arguments, auto-created output dirs
 ├── docs/
 │   └── statistical_methods.md        # methodology rationale and assumptions
 ├── tests/
@@ -125,11 +127,11 @@ uvicorn app.main:app --reload
 
 ### 4. Run the tests
 
-Tests import `backend.app.*`, so they must run from the **parent** directory (`D:\assignments\backend`):
+Tests import `app.*`, so they must run from **this** directory (`backend/backend`):
 
 ```powershell
-cd ..
-pytest backend/tests -m "not integration"
+cd D:\assignments\backend\backend
+D:\assignments\backend\venv_earthalive\Scripts\python.exe -m pytest tests -m "not integration" -q
 ```
 
 Integration tests hit live NASA Earthdata and download files; exclude them unless you intend to.
@@ -145,12 +147,11 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/api/v1/health/` | Health check |
 | GET | `/api/v1/variables/` | List supported environmental variables (static metadata) |
 | GET | `/api/v1/variables/{variable_id}` | Single variable metadata |
-| POST | `/api/analysis/trend` | Run MODIS LST acquisition + trend analysis |
-| GET | `/api/analysis/health` | Analysis service liveness |
+| POST | `/api/v1/analysis/trend` | Run MODIS LST acquisition + trend analysis |
+| GET | `/api/v1/analysis/health` | Analysis service liveness |
 
-> **Inconsistency:** `analysis` is mounted under `/api`, while everything else is under `/api/v1` (`app/main.py:28-41`). The primary feature is the odd one out. Standardize on `/api/v1` before the client hardens its URLs.
 
-### `POST /api/analysis/trend`
+### `POST /api/v1/analysis/trend`
 
 Request body:
 
@@ -219,7 +220,7 @@ HTTP request
 
 ## Workflows
 
-### 1. Live analysis path (`POST /api/analysis/trend`)
+### 1. Live analysis path (`POST /api/v1/analysis/trend`)
 
 This is the only production path.
 
@@ -241,6 +242,16 @@ The API route **does not call it**. It reimplements a smaller, divergent subset 
 ### 3. Offline / CLI pipelines
 
 - `run_modis_egypt_pipeline` (`app/services/modis_processor.py:170`) is a standalone CLI/`__main__` pipeline for the Egypt bounding box.
+- `python -m app.services.raster_processor` inspects an LST/QC GeoTIFF pair and renders a heatmap. All paths are arguments, and defaults are project-rooted under `data/processed`:
+
+```powershell
+python -m app.services.raster_processor --lst path/to/LST.tif --qc path/to/QC.tif `
+    --output out/heatmap.png --title "MODIS Land Surface Temperature"
+# --stats-only prints statistics without writing a heatmap
+# --plot-only writes the heatmap without printing statistics
+```
+
+  Missing inputs raise `FileNotFoundError` with the resolved path; the output directory is created automatically.
 - `tests/test_global_aoi.py` contains `_run_aoi_pipeline`, a third implementation of the same tile → mask → reproject → mosaic loop for four test regions.
 
 The same raster loop therefore exists in three places: `run_modis_egypt_pipeline`, `process_aoi_for_date`, and the test helper. Only `process_aoi_for_date` is used by the API.
@@ -248,8 +259,8 @@ The same raster loop therefore exists in three places: `run_modis_egypt_pipeline
 ### 4. Test workflow
 
 - Unit tests exercise pure helpers and services with `tmp_path`.
-- Integration tests are marked `@pytest.mark.integration` but there is **no `pytest.ini` in this copy**, so the marker is unregistered and the tests run by default. Running plain `pytest` will attempt live NASA downloads.
-- Tests import `backend.app.*`, so the repository root must be on `sys.path` — run pytest from the parent directory.
+- `pytest.ini` registers the `integration` marker, but it is not in `addopts`, so integration tests still run by default. Use `-m "not integration"` to skip live NASA downloads.
+- Tests import `app.*`, matching `uvicorn app.main:app`; run pytest from `backend/backend`.
 
 ---
 
@@ -360,7 +371,7 @@ Regions are plain bounding-box dictionaries `{west, south, east, north}`. Use th
 
 All paths are derived from `Path(__file__).resolve().parents[3]`, which is fragile and cannot be overridden by environment variables. There is no TTL, no cleanup, and no size limit.
 
-Credentials are handled separately by `app/core/config.py`: it loads the project `.env` at import time (without overriding existing environment variables) and exposes `get_settings()`. Only Earthdata credentials and the auth strategy are configurable this way today; data paths are still hardcoded.
+Credentials are handled separately by `app/core/config.py`: it loads the project `.env` at import time (without overriding existing environment variables) and exposes `get_settings()`. Only Earthdata credentials and the auth strategy are configurable this way today; data paths are still code-level constants (project-rooted, but not environment-overridable), apart from the `raster_processor` CLI flags.
 
 ---
 
@@ -420,11 +431,11 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 - `requirements.txt` is a full `pip freeze` tied to the generating platform (Python 3.14 / Windows), not a curated dependency list; GDAL remains an undocumented system dependency.
 - No packaging (`pyproject.toml`); the `try: from app... except ModuleNotFoundError: from backend.app...` shim is copy-pasted across route and service modules. It now re-raises unrelated missing packages, but the duplication remains.
 - `modis_downloader.py` is dead duplicate code.
-- `raster_processor.py` is a legacy script with hardcoded paths, Arabic comments, and `plt.show()`.
+- Path handling is now centralized in `app/utils/paths.py` for the raster CLI and MODIS outputs, but `statistical_analysis`/`modis_timeseries` still build some artifact paths inline instead of going through the helpers.
 - `allow_origins=["*"]`, no authentication, no rate limiting, no Dockerfile.
 - Pydantic v2 deprecated `example=` in `Field`; use `json_schema_extra`.
 - `__pycache__` artifacts sit in the tree; no `.gitignore`.
-- No `pytest.ini` here, so the `integration` marker is unregistered and network tests run by default.
+- The `integration` marker is registered in `pytest.ini`, but it is not in `addopts`, so network tests still run by default unless you pass `-m "not integration"`.
 
 ---
 
@@ -437,12 +448,12 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 3. Average overlapping tiles instead of last-wins.
 4. Rename `paired_period_t_test` to `welch_period_t_test` (or implement a true paired test).
 5. Fix tau tie handling.
-6. Delete `modis_downloader.py`; retire or rewrite `raster_processor.py`.
+6. Delete `modis_downloader.py` (done for `raster_processor.py`: rewritten as a parameterized CLI).
 7. Complete and pin `requirements.txt`; add `pytest.ini` with `addopts = -m "not integration"`.
 
 ### P1 — Unify the architecture (highest leverage)
 
-1. Make `POST /api/analysis/trend` call `analyze_time_series`; delete the inline dispatch.
+1. Make `POST /api/v1/analysis/trend` call `analyze_time_series`; delete the inline dispatch.
 2. Extract one shared `mosaic_tiles_for_aoi(...)` used by the API, the Egypt CLI, and integration tests.
 3. Validate the time series **once** per request and pass the validated frame into each method (currently rebuilt ~6 times per call).
 4. Split Pydantic schemas into `app/api/schemas.py` and type the response envelope.
@@ -472,7 +483,7 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 ## Repository hazards
 
 - **Duplicate codebase:** `D:\assignments\backend\EALive\backend` is a byte-identical copy of this tree (verified by hashing `main.py`, `analysis.py`, `modis_timeseries.py`, `statistical_analysis.py`, `modis_processor.py`). It also contains the only `pytest.ini` and a populated `data/` directory. Edits in one copy do not propagate to the other. Decide which is canonical and remove or archive the other.
-- **Run location matters:** tests import `backend.app.*` and must be executed from `D:\assignments\backend`, while the app itself is imported as `app.*` from `D:\assignments\backend\backend`. Packaging will remove this ambiguity.
+- **Run location matters:** tests import `app.*` and run from `D:\assignments\backend\backend`; the `try: from app... except ModuleNotFoundError: from backend.app...` shims still allow importing from the parent directory. Packaging will remove this ambiguity.
 - **No VCS:** this directory is not a git repository. There is no way to diff changes or recover overwritten work.
 
 ---

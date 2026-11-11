@@ -6,9 +6,8 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-try:
-    from app.services.modis_timeseries import TimeSeriesConfig, collect_mod11a1_timeseries
-    from app.services.statistical_analysis import (
+from app.services.modis_timeseries import TimeSeriesConfig, collect_mod11a1_timeseries
+from app.services.statistical_analysis import (
         linear_regression_analysis,
         mann_kendall_analysis,
         modified_mann_kendall_analysis,
@@ -16,21 +15,6 @@ try:
         seasonal_mann_kendall_analysis,
         validate_time_series,
     )
-except ModuleNotFoundError as exc:  # pragma: no cover - repo-root compatibility
-    # Only retry when the top-level "app" package itself is not importable.
-    # Missing third-party packages must not be masked.
-    if exc.name not in {"app", "backend"}:
-        raise
-    from backend.app.services.modis_timeseries import TimeSeriesConfig, collect_mod11a1_timeseries
-    from backend.app.services.statistical_analysis import (
-        linear_regression_analysis,
-        mann_kendall_analysis,
-        modified_mann_kendall_analysis,
-        paired_period_t_test,
-        seasonal_mann_kendall_analysis,
-        validate_time_series,
-    )
-
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 
 SUPPORTED_PRODUCTS = {"MOD11A1"}

@@ -160,9 +160,48 @@ Liveness probes were calling `GET /health` and receiving 404; the only health ro
 
 ---
 
+## 2026-11-11 — Path utilities and parameterized `raster_processor`
+
+`app/services/raster_processor.py` hardcoded input/output paths and ended with an interactive `plt.show()`, so it could not run headless or be tested against fixtures.
+
+Added reusable filesystem helpers in `app/utils/paths.py`:
+
+| Helper | Behaviour |
+| --- | --- |
+| `ensure_directory(path)` | Creates the directory and missing parents; idempotent; returns the `Path`. |
+| `ensure_parent_directory(file_path)` | Creates only the parent of a file path; returns the unchanged file `Path`. |
+| `require_file(path, description)` | Raises `FileNotFoundError` with the resolved path and a human-readable description. |
+
+Rewrote `app/services/raster_processor.py`:
+
+- Every path is now an argument: `analyze_lst_quality(lst_path, qc_path)` and `plot_temperature(lst_path, qc_path, output_path, title)`.
+- Defaults still exist, but are project-rooted via `PROCESSED_DATA_DIR` (`D:\assignments\backend\data\processed`), not relative to the current working directory.
+- Missing inputs fail early through `require_file`; the heatmap output directory is created through `ensure_parent_directory`.
+- `analyze_lst_quality` returns a statistics dict (`total_pixels`, `valid_lst_pixels`, `good_quality_pixels`, min/mean/max °C) instead of only printing.
+- Uses the Matplotlib `Agg` backend and closes figures; no `plt.show()`, so it is safe in CI and on a server.
+- Added a CLI: `python -m app.services.raster_processor --lst ... --qc ... --output ... --title ...` plus `--stats-only` / `--plot-only`.
+
+Tests: added `tests/test_raster_processor.py` (8 tests) covering directory creation, parent creation, `require_file` errors, absolute project-rooted defaults, statistics from fixture GeoTIFFs, missing-input handling, output-directory creation, and CLI parsing. All 8 pass.
+
+Also updated the API tests to the current mount point: `analysis` was moved from `/api` to `/api/v1` in `app/main.py`, so `tests/test_api_analysis.py` now calls `/api/v1/analysis/trend`.
+
+Suite result from `backend/backend`:
+
+```powershell
+python -m pytest tests -m "not integration" -q
+# 56 passed, 2 failed, 3 deselected
+```
+
+The two failures remain the artifact-dependent `test_modis_validation.py` cases described below.
+
+Note: the rewrite of `app/main.py` also dropped the unversioned `/health` alias, so external liveness probes will 404 again. The canonical `/api/v1/health/` route is unaffected. Restoring the alias is pending a decision — it was not re-added silently.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `pyhdf`-based reader.
 - The two artifact-dependent tests should move under the `integration` marker (or skip when the files are absent).
 - The duplicate `EALive/backend` tree still exists and is byte-identical; pick a canonical copy.
+- The unversioned `/health` alias was removed by the `app/main.py` rewrite; decide whether to restore it for external probes or keep only `/api/v1/health/`.
 - The P0–P3 roadmap in `README.md` is unchanged: unify orchestration, preserve missing periods, fix artifact collisions, then async jobs and guards.

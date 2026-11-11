@@ -4,12 +4,7 @@ from typing import Any
 
 import earthaccess
 
-try:
-    from app.core.config import get_settings
-except ModuleNotFoundError as exc:  # pragma: no cover - repo-root compatibility
-    if exc.name not in {"app", "backend"}:
-        raise
-    from backend.app.core.config import get_settings
+from app.core.config import get_settings
 
 
 def ensure_earthaccess_auth(persist: bool = False) -> Any:
