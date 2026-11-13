@@ -27,6 +27,7 @@ _ALIASES = {
     "mod11a1": "land_surface_temperature",
     "ndvi": "ndvi",
     "mod13q1": "ndvi",
+    "mod13a1": "ndvi",
     "precipitation": "precipitation",
     "gpm": "precipitation",
     "gpm_3imergd": "precipitation",

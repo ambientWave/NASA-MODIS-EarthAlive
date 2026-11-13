@@ -50,7 +50,9 @@ backend/backend/
 │   ├── core/
 │   │   └── config.py                 # .env loading + Earthdata settings
 │   ├── utils/
-│   │   └── paths.py                  # ensure_directory / ensure_parent_directory / require_file
+│   │   ├── paths.py                  # ensure_directory / ensure_parent_directory / require_file
+│   │   ├── cache.py                  # shared, byte-capped cache + atomic writes
+│   │   └── logging.py                # timestamped stdout logging for long jobs
 │   ├── api/
 │   │   └── routes/
 │   │       ├── health.py             # GET /api/v1/health/
@@ -75,6 +77,7 @@ backend/backend/
 ├── tests/
 │   ├── test_api_analysis.py          # endpoint contract tests
 │   ├── test_api_jobs.py              # job listing, details, cancellation
+│   ├── test_ndvi_cache.py            # NDVI waves, AOI cache, atomic writes, LRU trim
 │   ├── test_statistical_analysis.py  # statistics unit tests
 │   ├── test_modis_timeseries.py      # collection/aggregation unit tests + integration
 │   ├── test_modis_validation.py      # QA mask / conversion / artifact validation
@@ -213,14 +216,15 @@ Request body:
 }
 ```
 
-- `variable`: `land_surface_temperature` (LST), `ndvi`, `precipitation`, `soil_moisture`, or `air_temperature`. Aliases such as `LST`, `MOD11A1`, `MOD13Q1`, `GPM`, `SMAP`, and `MERRA` are accepted.
-- `product`: deprecated alias for `variable`; a dataset short name (`MOD11A1`, `MOD13Q1`, `GPM_3IMERGD`, `SPL3SMP_E`, `M2SDNXSLV`). If both are sent they must resolve to the same variable.
+- `variable`: `land_surface_temperature` (LST), `ndvi`, `precipitation`, `soil_moisture`, or `air_temperature`. Aliases such as `LST`, `MOD11A1`, `MOD13A1`, `MOD13Q1`, `GPM`, `SMAP`, and `MERRA` are accepted.
+- `product`: deprecated alias for `variable`; a dataset short name (`MOD11A1`, `MOD13A1`, `MOD13Q1`, `GPM_3IMERGD`, `SPL3SMP_E`, `M2SDNXSLV`). If both are sent they must resolve to the same variable.
 - If neither is sent, the endpoint defaults to `land_surface_temperature`.
 - `temporal_resolution`: `daily` | `monthly` | `yearly`
 - `analysis_methods`: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`
 - `start_date` must be on or after `2000-02-24`; the range is capped at `366 * 30` days.
 - `monthly` and `yearly` aggregate the daily variable records to period means. Precipitation stays a mean daily rate (`mm/day`) rather than a monthly total, so all variables use the same statistic.
-- NDVI daily records are MOD13Q1 16-day period values carried forward across their window (`source_frequency: "16-day"`, `coverage_status: "period_value"`).
+- NDVI daily records are MODIS 16-day period values carried forward across their window (`source_frequency: "16-day"`, `coverage_status: "period_value"`). The default product is **MOD13A1 (500 m)**; set `NDVI_PRODUCT=MOD13Q1` for 250 m.
+- NDVI is analysed on a 0.005° grid (about 500 m) for MOD13A1 and 0.0025° for MOD13Q1, matching each product's native pixel size.
 
 The route validates the request and enqueues a `trend_analysis` job, returning `202`:
 
@@ -239,7 +243,7 @@ Poll `status_url`, then fetch the result envelope from `result_url`:
 {
   "success": true,
   "job_id": "9c0f...",
-  "metadata": { "mode": "trend_analysis", "variable": "ndvi", "display_name": "Vegetation Index (NDVI)", "product": "MOD13Q1", "unit": "NDVI", "native_resolution": "16-day", "temporal_resolution": "monthly", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
+  "metadata": { "mode": "trend_analysis", "variable": "ndvi", "display_name": "Vegetation Index (NDVI)", "product": "MOD13A1", "unit": "NDVI", "native_resolution": "16-day", "temporal_resolution": "monthly", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
   "data_quality": { "observation_count": 12, "valid_observation_count": 12, "missing_observation_percentage": 0.0, "data_coverage_percentage": 98.3, "warnings": [] },
   "analysis_results": { "linear_regression": {}, "mann_kendall": {} },
   "visualizations": {
@@ -268,6 +272,8 @@ All three analysis endpoints (`/trend`, `/compare/variables`, `/compare/regions`
 ```
 
 Work runs in an RQ worker backed by Redis (`ANALYSIS_QUEUE_MODE=redis`). Set `ANALYSIS_QUEUE_MODE=inline` to execute the job in-process for tests or local debugging without Redis. Job status and results are persisted as JSON under `data/jobs/{job_id}/`.
+
+Compose starts **two workers by default** (`deploy.replicas: 2`) so a download-bound job does not block a compute-bound one. Scale with `docker compose up -d --scale worker=4`. Worker jobs are capped by `ANALYSIS_JOB_TIMEOUT` (default `21600` seconds, six hours) so a wedged download fails instead of holding the worker forever. The job store, cancellation marker, and shared cache are all files under `./data`, so replicas coordinate without extra infrastructure.
 
 Supported variables: `land_surface_temperature`, `ndvi`, `precipitation`, `soil_moisture`, `air_temperature`. Supported methods: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`. Only `temporal_resolution: "daily"` is accepted.
 
@@ -365,12 +371,38 @@ If the forced stop command cannot be delivered, the endpoint falls back to coope
 | Variable | Dataset | Native frequency | Notes |
 | --- | --- | --- | --- |
 | `land_surface_temperature` | MOD11A1 | daily | Existing MODIS pipeline; QA mask and Kelvin→Celsius |
-| `ndvi` | MOD13Q1 | 16-day | Each composite is carried forward across its 16-day window to produce daily rows |
+| `ndvi` | MOD13A1 (default) / MOD13Q1 | 16-day | Each composite is carried forward across its 16-day window; 500 m by default, `NDVI_PRODUCT=MOD13Q1` for 250 m |
 | `precipitation` | GPM_3IMERGD | daily | Remote `earthaccess.open()` + xarray AOI subset |
 | `soil_moisture` | SPL3SMP_E | daily | Remote subset with retrieval-quality filtering |
 | `air_temperature` | M2SDNXSLV | daily | Kelvin→Celsius |
 
 NDVI daily rows are **period values**, not interpolated observations. Each record declares `source_frequency: "16-day"` and `coverage_status: "period_value"`; days beyond the 16-day window of the last available composite are explicit missing observations.
+
+### NDVI performance and caching
+
+NDVI is the only variable that downloads full MODIS tiles. A national AOI such as Egypt straddles four sinusoidal tiles, so one 16-day composite is four granules (about 60 MB each for MOD13A1, 200+ MB each for MOD13Q1).
+
+Three things keep that manageable:
+
+1. **AOI-first warping.** Each granule is warped with a single `gdalwarp -t_srs EPSG:4326 -te <aoi> -ts <w> <h>` call that reads only the slice of the HDF4 subdataset covering the AOI and writes an array already on the analysis grid. This replaces a full-tile `gdal_translate` plus a `rasterio` read plus a `reproject()`, and produces identical means.
+2. **Waves.** Composites are processed in groups of whole composites (`NDVI_GRANULE_BATCH`, default 8 granules). A wave is downloaded with up to `NDVI_DOWNLOAD_THREADS` parallel streams (default 8), then its granules are warped in a `NDVI_WARP_WORKERS` thread pool (default 4), then the wave's means are computed. Peak disk use is one wave, not one year.
+3. **Shared cache under `data/cache/<product>/`.** `raw/` holds downloaded HDFs, `aoi/<hash>/` holds the warped NDVI and QA rasters for one AOI (about 1 MB per granule). The AOI cache is checked *before* contacting Earthdata, so re-running the same analysis over the same AOI downloads nothing. The whole cache is trimmed to `ANALYSIS_CACHE_GB` (default 0.5 GB) after every wave; files touched in the last 10 minutes are never evicted, so concurrent workers cannot delete each other's inputs.
+
+Downloads are logged with elapsed time and megabytes, an `already cached` line when granules are reused, and a heartbeat every 15 seconds:
+
+```text
+modis: downloading 8 granule(s) for 2023-01-01..2023-01-17 (2 composites)
+modis: still downloading for 2023-01-01..2023-01-17 (2 composites)… 45s elapsed, 87.2 MB
+modis: downloaded 8 granule(s) in 128.4s (479.6 MB) for 2023-01-01..2023-01-17 (2 composites)
+variables: ndvi: already cached 4 granule(s) for 2023-02-02
+```
+
+Job status reports per-composite progress instead of sitting at a chunk boundary:
+
+```json
+{ "stage": "collecting", "label": "ndvi composite 2023-03-06 (5/23)", "current": 5, "total": 23, "percent": 21.74 }
+```
+
 
 ---
 
@@ -522,7 +554,7 @@ Insufficient data is **never** raised from the statistics layer — only `valida
 
 ### Recipe: add a new satellite product
 
-Example: MOD13Q1 NDVI.
+Example: MOD13A1 NDVI.
 
 1. Create `app/services/<product>_timeseries.py` with its own config dataclass, QA/scale constants (do **not** reuse MOD11A1 QA bits or the 0.02/273.15 conversion), and a `collect_<product>_timeseries(config)` function.
 2. Emit the canonical collector record shape, replacing temperature fields with the product's measurement fields while keeping date/pixel/missing fields identical.
@@ -564,9 +596,22 @@ Regions are plain bounding-box dictionaries `{west, south, east, north}`. Use th
 | `data/processed/analysis/` | Default analysis output directory |
 | `data/jobs/{job_id}/` | Comparison job status, intermediate artifacts, and `result.json` |
 | `data/cache/modis_granule_cache.json` | Granule download cache (filename → local path) |
+| `data/cache/<product>/raw/` | Shared downloaded HDFs (LRU, `ANALYSIS_CACHE_GB`) |
+| `data/cache/<product>/aoi/<hash>/` | Warped NDVI/QA rasters for one AOI, reused across jobs |
 | `data/processed/global_tests/` | Integration-test outputs, per region |
 
-All paths are derived from `Path(__file__).resolve().parents[3]`, which is fragile and cannot be overridden by environment variables. There is no TTL, no cleanup, and no size limit.
+Paths are derived from `Path(__file__).resolve().parents[3]`, which resolves to `/srv/backend` in the container (where `./data` is mounted) and to the repository parent locally. The shared analysis cache can be relocated with `ANALYSIS_CACHE_DIR` and is size-capped with `ANALYSIS_CACHE_GB` (default `0.5`); job artifacts under `data/jobs/` are still never pruned automatically.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `NDVI_PRODUCT` | `MOD13A1` | NDVI source product (`MOD13A1` 500 m or `MOD13Q1` 250 m) |
+| `NDVI_GRANULE_BATCH` | `8` | Granules downloaded per wave |
+| `NDVI_DOWNLOAD_THREADS` | `8` | Parallel HTTP streams per wave |
+| `NDVI_WARP_WORKERS` | `4` | Parallel `gdalwarp` subprocesses |
+| `ANALYSIS_CACHE_DIR` | `data/cache` | Shared cache location |
+| `ANALYSIS_CACHE_GB` | `0.5` | Cache budget before LRU eviction |
+| `ANALYSIS_JOB_TIMEOUT` | `21600` | RQ job timeout in seconds |
+| `MAX_DAYS_PER_DAILY_JOB` | `1826` | Chunk size for long date ranges |
 
 Credentials are handled separately by `app/core/config.py`: it loads the project `.env` at import time (without overriding existing environment variables) and exposes `get_settings()`. Only Earthdata credentials and the auth strategy are configurable this way today; data paths are still code-level constants (project-rooted, but not environment-overridable), apart from the `raster_processor` CLI flags.
 

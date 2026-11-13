@@ -33,8 +33,12 @@ services:
       WATCHFILES_FOR_POLLING: "true"
       # conda-forge GDAL with the HDF4 plugin, installed in the image.
       GDAL_TRANSLATE: "/opt/gdal/bin/gdal_translate"
+      GDAL_WARP: "/opt/gdal/bin/gdalwarp"
       ANALYSIS_QUEUE_MODE: "redis"
       REDIS_URL: "redis://redis:6379/0"
+      # Shared cache for downloaded granules and AOI rasters (bounded LRU).
+      ANALYSIS_CACHE_GB: "0.5"
+      ANALYSIS_JOB_TIMEOUT: "21600"
     volumes:
       # Live source for uvicorn --reload.
       - ./app:/srv/backend/backend/app
@@ -57,7 +61,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: earth-alive-api:dev
-    container_name: earth-alive-worker
+    # No fixed container_name: Compose cannot scale a service that pins one.
+    # Run `docker compose up -d --scale worker=2` for concurrent jobs.
     # Use the module entry point instead of the `rq` console script: console
     # scripts depend on the pip scripts directory being on PATH, while
     # `python -m` only needs the installed package.
@@ -68,8 +73,11 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       GDAL_TRANSLATE: "/opt/gdal/bin/gdal_translate"
+      GDAL_WARP: "/opt/gdal/bin/gdalwarp"
       ANALYSIS_QUEUE_MODE: "redis"
       REDIS_URL: "redis://redis:6379/0"
+      ANALYSIS_CACHE_GB: "0.5"
+      ANALYSIS_JOB_TIMEOUT: "21600"
     volumes:
       - ./app:/srv/backend/backend/app
       - ./data:/srv/backend/data
@@ -78,6 +86,10 @@ services:
         condition: service_healthy
     init: true
     restart: unless-stopped
+    # Two workers by default so a download-bound job does not starve a
+    # compute-bound one. `docker compose up -d --scale worker=N` overrides it.
+    deploy:
+      replicas: 2
 
 volumes:
   redis-data:

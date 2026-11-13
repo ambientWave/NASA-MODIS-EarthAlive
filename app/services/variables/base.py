@@ -32,6 +32,13 @@ class CollectionRequest:
     output_dir: Path
     temporal_resolution: str = "daily"
     should_cancel: Callable[[], bool] | None = None
+    # Optional fine-grained reporting. ``progress`` is the job's callback and is
+    # called as ``(stage, label, current, total, percent)``; ``percent`` lets a
+    # collector report sub-chunk progress without the job guessing.
+    progress: Callable[..., None] | None = None
+    progress_label: str = ""
+    chunk_index: int = 1
+    chunk_total: int = 1
 
     def check_cancel(self) -> None:
         """Raise ``JobCanceled`` when the owning job has been canceled.
@@ -41,6 +48,17 @@ class CollectionRequest:
         half-way.
         """
         raise_if_canceled(self.should_cancel)
+
+    def report(self, current: int, total: int, detail: str = "") -> None:
+        """Report progress inside a chunk (e.g. one MODIS composite)."""
+        if self.progress is None:
+            return
+        fraction = (current / total) if total > 0 else 0.0
+        percent = None
+        if self.chunk_total > 0:
+            percent = ((self.chunk_index - 1) + fraction) / self.chunk_total * 100.0
+        label = f"{self.progress_label} {detail}".strip() or "collecting"
+        self.progress("collecting", label, int(current), int(total), percent)
 
 
 @dataclass

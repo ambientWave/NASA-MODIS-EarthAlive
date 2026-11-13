@@ -122,7 +122,7 @@ def test_analysis_trend_supports_ndvi_variable(monkeypatch, tmp_path):
 
     body = client.get(response.json()["result_url"]).json()
     assert body["metadata"]["variable"] == "ndvi"
-    assert body["metadata"]["product"] == "MOD13Q1"
+    assert body["metadata"]["product"] == "MOD13A1"
     assert body["metadata"]["unit"] == "NDVI"
     assert "linear_regression" in body["analysis_results"]
 
@@ -131,12 +131,12 @@ def test_analysis_trend_accepts_dataset_short_name_as_product(monkeypatch, tmp_p
     _use_inline_jobs(monkeypatch, tmp_path, _fake_collect(_records([0.2, 0.3, 0.4, 0.5])))
     client = TestClient(app)
 
-    response = client.post("/api/v1/analysis/trend", json=_payload(product="MOD13Q1"))
+    response = client.post("/api/v1/analysis/trend", json=_payload(product="MOD13A1"))
     assert response.status_code == 202, response.text
 
     body = client.get(response.json()["result_url"]).json()
     assert body["metadata"]["variable"] == "ndvi"
-    assert body["metadata"]["product"] == "MOD13Q1"
+    assert body["metadata"]["product"] == "MOD13A1"
 
 
 def test_analysis_trend_rejects_conflicting_variable_and_product():

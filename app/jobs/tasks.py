@@ -11,9 +11,19 @@ from app.services.trend_service import execute_trend_analysis
 from app.utils.logging import log
 
 
-def _progress(job_id: str, kind: str, stage: str, label: str, current: int, total: int) -> None:
+def _progress(
+    job_id: str,
+    kind: str,
+    stage: str,
+    label: str,
+    current: int,
+    total: int,
+    percent: float | None = None,
+) -> None:
     status = read_status(job_id) or {"job_id": job_id, "kind": kind, "created_at": utc_now()}
     cancel_requested = is_cancel_requested(job_id)
+    if percent is None:
+        percent = 0.0 if total <= 0 else (current / total) * 100.0
     status.update(
         {
             # Keep reporting "canceling" if a cancel arrived while this step ran.
@@ -23,7 +33,7 @@ def _progress(job_id: str, kind: str, stage: str, label: str, current: int, tota
             "label": label,
             "current": int(current),
             "total": int(total),
-            "percent": 0.0 if total <= 0 else round((current / total) * 100.0, 2),
+            "percent": round(max(0.0, min(float(percent), 100.0)), 2),
             "updated_at": utc_now(),
         }
     )
@@ -58,8 +68,8 @@ def run_job(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     def should_cancel() -> bool:
         return is_cancel_requested(job_id)
 
-    def progress(stage: str, label: str, current: int, total: int) -> None:
-        _progress(job_id, kind, stage, label, current, total)
+    def progress(stage: str, label: str, current: int, total: int, percent: float | None = None) -> None:
+        _progress(job_id, kind, stage, label, current, total, percent)
 
     try:
         # A job can be canceled while it waits in the queue.

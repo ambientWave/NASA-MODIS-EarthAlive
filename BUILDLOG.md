@@ -540,6 +540,103 @@ Verification:
 
 ---
 
+## 2026-11-13 - NDVI: product switch, AOI warping, shared cache, parallel waves
+
+"NDVI feels very slow" turned out to be two separate problems, and the first
+measurement changed the plan.
+
+### What the measurements showed
+
+`gdal_translate` + `rasterio` + `reproject` cost about 28 s per granule:
+16.4 s (NDVI full tile) + 4.4 s (QA) + 5.5 s (read) + 2.0 s (`reproject`).
+A single `gdalwarp` that reads only the AOI window and writes the destination
+grid took 8.8 s for the same pair, and produced **the same NDVI mean (0.2163)
+with the same valid-pixel count (2,041,496)**. So the processing path was
+replaced, not tuned.
+
+The requested `gdal_translate -projwin -projwin_srs EPSG:4326` does **not** do
+this on sinusoidal HDF: the 4326 bounding box is transformed corner-wise, the
+window can exceed the source tile (measured 6336x4656 from a 4800x4800 tile),
+and the output is still sinusoidal, so the Python reprojection remains. It was
+abandoned in favour of `gdalwarp -te ... -ts ...`.
+
+The bigger cost is the download, and it was underestimated. CMR returns four
+sinusoidal tiles for the full Egypt AOI (`h20v05`, `h20v06`, `h21v05`,
+`h21v06`). At MOD13Q1 250 m that is ~820 MB per 16-day composite (~18 GB per
+year); at MOD13A1 500 m it is ~240 MB (~5.5 GB per year). The earlier "128 MB
+per composite" came from a job whose AOI fit inside one tile.
+
+### Changes
+
+1. **Product switch.** NDVI now defaults to MOD13A1 (500 m); `NDVI_PRODUCT=MOD13Q1`
+   keeps the old product. `SPEC.dataset` follows the choice, and the analysis
+   grid moved to 0.005° (0.0025° for MOD13Q1), so the Egypt grid drops from
+   4880x3880 to 2440x1940. The MOD13A1 aliases were also added to
+   `resolve_variable_id`.
+
+2. **AOI-first warping.** New `warp_subdataset_to_aoi()` in `modis_processor.py`
+   runs one `gdalwarp -t_srs EPSG:4326 -te <aoi> -ts <w> <h> -r <bilinear|near>`
+   per granule. It uses `-srcnodata -3000` / `-dstnodata -32768` for NDVI and
+   `255`/`255` for QA, so fill pixels are never counted as `NDVI = 0`.
+   `-ts` (not `-tr`) guarantees the array shape matches
+   `destination_grid_size()`, which lets `_composite_mean` drop the
+   reprojection step entirely.
+
+3. **Waves.** Composites are processed in groups of whole composites
+   (`NDVI_GRANULE_BATCH`, default 8 granules): download the wave with
+   `NDVI_DOWNLOAD_THREADS` parallel streams, warp its granules in a
+   `NDVI_WARP_WORKERS` thread pool, then compute the wave's means. A wave
+   boundary never splits a composite, so per-composite results stay exact.
+   Peak disk is one wave instead of one year of granules.
+
+4. **Shared cache.** `data/cache/<product>/raw/` keeps HDFs,
+   `data/cache/<product>/aoi/<hash>/` keeps the warped NDVI and QA rasters for
+   one AOI. The AOI cache is checked **before** contacting Earthdata, so a
+   repeated analysis of the same AOI downloads nothing. `app/utils/cache.py`
+   provides atomic writes (unique `.part.tif` + `os.replace`), an LRU trim to
+   `ANALYSIS_CACHE_GB` (default 0.5 GB), and a 10-minute guard so a concurrent
+   worker cannot evict a file another worker is reading.
+
+5. **Download observability.** `download_granules()` logs
+   `already cached N granule(s)`, `downloading N granule(s) for <range>`,
+   a 15-second heartbeat with elapsed seconds and megabytes, and
+   `downloaded N granule(s) in Xs (Y MB)`. A failed batch falls back to
+   one-file-at-a-time retries so one dead link cannot lose the whole wave.
+   Existing files are detected before the call because `earthaccess` skips
+   them without reporting anything.
+
+6. **Per-composite progress.** `CollectionRequest` gained `progress`,
+   `progress_label`, `chunk_index`, `chunk_total`, and a `report()` helper that
+   blends composite progress into the chunk progress. Job status now reads
+   `ndvi composite 2023-03-06 (5/23)` with a monotonic percentage instead of
+   jumping between chunk boundaries.
+
+7. **Finite job timeout.** Jobs are no longer enqueued with
+   `job_timeout=-1`; `ANALYSIS_JOB_TIMEOUT` defaults to 21600 s (six hours).
+
+8. **Compose scaling.** The worker no longer pins `container_name` (Compose
+   cannot scale a pinned service) and runs `deploy.replicas: 2` by default.
+   `docker compose up -d --scale worker=N` overrides it. Status files, the
+   cancel marker, and the cache are all under `./data`, so replicas share state
+   without new infrastructure.
+
+### Verification
+
+- The new warp path was run against a real MOD13Q1 granule in the container:
+  `mean 0.2163`, `valid 2041496`, output shape exactly `(3880, 4880)`.
+- `find_gdalwarp()` resolved `/opt/gdal/bin/gdalwarp` from
+  `GDAL_TRANSLATE`'s directory without `GDAL_WARP` being set, which is the
+  state of an older container.
+- `pytest tests -m "not integration"`: 108 passed, 3 failed, 3 deselected. The
+  three failures are the artifact-only Egypt tests.
+- New `tests/test_ndvi_cache.py` covers AOI-key stability, wave boundaries,
+  tile merging and QA masking, atomic writes, LRU eviction, fresh-file
+  protection, cached-download detection/logging, batch-failure fallback, and
+  blended progress percentages.
+- `compileall` and `docker compose config --quiet` pass.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".

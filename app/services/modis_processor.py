@@ -5,8 +5,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import earthaccess
 import matplotlib
@@ -80,7 +82,154 @@ def download_mod11a1_granules(granules: list[Any], target_dir: str | Path | None
     return [Path(path) for path in paths]
 
 
+def granule_filename(granule: Any) -> str | None:
+    """Best-effort local filename for a granule (prefers the ``.hdf`` link)."""
+    try:
+        links = granule.data_links()
+    except Exception:
+        links = []
+    names = [Path(str(link).split("?")[0]).name for link in links if link]
+    for name in names:
+        if name.lower().endswith(".hdf"):
+            return name
+    return names[0] if names else None
+
+
+def _heartbeat(
+    target: Path,
+    initial_bytes: int,
+    started_at: float,
+    stop: threading.Event,
+    label: str,
+    interval: float,
+    on_progress: Callable[[float, int], None] | None = None,
+) -> None:
+    """Log download progress every ``interval`` seconds until ``stop`` is set.
+
+    ``on_progress(elapsed_seconds, bytes_written)`` lets the caller mirror the
+    same numbers into job status, so a slow download stays visible in the API
+    without reading worker logs.
+    """
+    while not stop.wait(interval):
+        written = max(_directory_bytes(target) - initial_bytes, 0)
+        elapsed = time.perf_counter() - started_at
+        log(
+            f"modis: still downloading{label}… "
+            f"{elapsed:.0f}s elapsed, {written / 1024 / 1024:.1f} MB"
+        )
+        if on_progress is not None:
+            try:
+                on_progress(elapsed, written)
+            except Exception as exc:  # status writes must never kill a download
+                log(f"modis: progress callback failed: {type(exc).__name__}: {exc}")
+
+
+def _directory_bytes(directory: Path) -> int:
+    total = 0
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return 0
+    for path in entries:
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def download_granules(
+    granules: list[Any],
+    target_dir: str | Path,
+    *,
+    threads: int = 8,
+    label: str = "",
+    heartbeat_seconds: float = 15.0,
+    on_progress: Callable[[float, int], None] | None = None,
+) -> tuple[list[Path], int, int]:
+    """Download granules, reusing files already on disk.
+
+    Returns ``(paths, already_present, downloaded_bytes)``. Existing files are
+    detected before the call because ``earthaccess`` silently skips them and
+    reports nothing about it. A batch failure falls back to one file at a time
+    so a single dead link cannot lose the whole wave.
+    """
+    target = Path(target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    suffix = f" {label}" if label else ""
+
+    wanted = [(granule, granule_filename(granule)) for granule in granules]
+    wanted = [(granule, name) for granule, name in wanted if name]
+    cached = [(granule, name) for granule, name in wanted if (target / name).is_file()]
+    missing = [granule for granule, name in wanted if not (target / name).is_file()]
+
+    if cached:
+        log(f"modis: already cached {len(cached)} granule(s){suffix}")
+
+    downloaded_bytes = 0
+    if missing:
+        log(f"modis: downloading {len(missing)} granule(s){suffix}")
+        initial_bytes = _directory_bytes(target)
+        started_at = time.perf_counter()
+        stop = threading.Event()
+        if on_progress is not None:
+            try:
+                on_progress(0.0, 0)
+            except Exception:
+                pass
+        monitor = threading.Thread(
+            target=_heartbeat,
+            args=(target, initial_bytes, started_at, stop, suffix, heartbeat_seconds, on_progress),
+            daemon=True,
+            name="modis-download-heartbeat",
+        )
+        monitor.start()
+        try:
+            earthaccess.download(missing, local_path=str(target), threads=threads, show_progress=False)
+        except Exception as exc:
+            log(
+                f"modis: batch download failed ({type(exc).__name__}: {exc}); "
+                "retrying one granule at a time"
+            )
+            for granule in missing:
+                try:
+                    earthaccess.download([granule], local_path=str(target), threads=1, show_progress=False)
+                except Exception as inner:
+                    log(f"modis: {granule_filename(granule)} failed: {type(inner).__name__}: {inner}")
+        finally:
+            stop.set()
+            monitor.join(timeout=1.0)
+        elapsed = time.perf_counter() - started_at
+        downloaded_bytes = max(_directory_bytes(target) - initial_bytes, 0)
+        still_missing = [name for _, name in wanted if not (target / name).is_file()]
+        succeeded = len(missing) - len(still_missing)
+        log(
+            f"modis: downloaded {succeeded} granule(s) in {elapsed:.1f}s "
+            f"({downloaded_bytes / 1024 / 1024:.1f} MB){suffix}"
+        )
+        if on_progress is not None:
+            try:
+                on_progress(elapsed, downloaded_bytes)
+            except Exception:
+                pass
+        if still_missing:
+            log(f"modis: {len(still_missing)} granule(s) still missing after retries{suffix}")
+        if succeeded == 0:
+            # Without this, an unauthenticated or fully failed download looks
+            # like "no valid observations" much later in the pipeline.
+            raise RuntimeError(
+                f"Could not download any of {len(missing)} MODIS granule(s){suffix}. "
+                "Check Earthdata credentials and network access."
+            )
+
+    paths = [target / name for _, name in wanted]
+    return paths, len(cached), downloaded_bytes
+
+
+
 GDAL_TRANSLATE_ENV_VAR = "GDAL_TRANSLATE"
+GDAL_WARP_ENV_VAR = "GDAL_WARP"
 
 
 def find_gdal_translate() -> str:
@@ -130,6 +279,98 @@ def extract_subdataset_to_tiff(
     )
     log(f"modis: wrote {output_tif.name}")
     return output_tif
+
+
+def find_gdalwarp() -> str:
+    """Return the ``gdalwarp`` executable, preferring ``GDAL_WARP``.
+
+    The Docker image installs GDAL outside ``PATH`` (only ``GDAL_TRANSLATE`` is
+    pointed at it), so the sibling of ``gdal_translate`` is a reliable fallback.
+    """
+    candidate = os.environ.get(GDAL_WARP_ENV_VAR)
+    if candidate and Path(candidate).is_file():
+        return candidate
+    found = shutil.which("gdalwarp")
+    if found:
+        return found
+    translate = os.environ.get(GDAL_TRANSLATE_ENV_VAR) or shutil.which("gdal_translate")
+    if translate:
+        sibling = Path(translate).with_name("gdalwarp" + Path(translate).suffix)
+        if sibling.is_file():
+            return str(sibling)
+    raise RuntimeError(
+        "gdalwarp was not found. AOI subsetting needs GDAL built with the HDF4 driver. "
+        f"Install it, add it to PATH, or set {GDAL_WARP_ENV_VAR} to the full executable path."
+    )
+
+
+def warp_subdataset_to_aoi(
+    hdf_path: str | Path,
+    subdataset_name: str,
+    output_tif: str | Path,
+    *,
+    grid_name: str,
+    bounds: tuple[float, float, float, float],
+    width: int,
+    height: int,
+    resampling: str = "bilinear",
+    src_nodata: float | None = None,
+    dst_nodata: float | None = None,
+    output_type: str | None = None,
+) -> Path:
+    """Warp one HDF4 subdataset straight onto the AOI's WGS84 grid.
+
+    This replaces the old ``gdal_translate`` full-tile dump followed by a
+    ``rasterio`` read and ``reproject``. GDAL only reads the source window that
+    covers ``bounds``, so a national AOI costs a fraction of the full tile, and
+    the numpy side gets an array that is already on the destination grid.
+    """
+    gdalwarp = find_gdalwarp()
+    hdf_path = str(hdf_path)
+    output_tif = Path(output_tif)
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+    gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":{grid_name}:{subdataset_name}'
+    west, south, east, north = bounds
+
+    command = [
+        gdalwarp,
+        "-q",
+        "-overwrite",
+        "-t_srs",
+        "EPSG:4326",
+        "-te",
+        str(west),
+        str(south),
+        str(east),
+        str(north),
+        # -ts (not -tr) guarantees the array matches destination_grid_size().
+        "-ts",
+        str(int(width)),
+        str(int(height)),
+        "-r",
+        resampling,
+        "-of",
+        "GTiff",
+        "-co",
+        "COMPRESS=LZW",
+        "-co",
+        "TILED=YES",
+        "-co",
+        "PREDICTOR=2",
+        "-co",
+        "BIGTIFF=IF_SAFER",
+    ]
+    if src_nodata is not None:
+        command += ["-srcnodata", str(src_nodata)]
+    if dst_nodata is not None:
+        command += ["-dstnodata", str(dst_nodata)]
+    if output_type:
+        command += ["-ot", output_type]
+    command += [gdal_uri, str(output_tif)]
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    return output_tif
+
 
 
 def read_raster(path: str | Path) -> tuple[np.ndarray, dict[str, Any]]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Any
 
@@ -24,6 +25,20 @@ def _redis_connection():
     from redis import Redis
 
     return Redis.from_url(REDIS_URL)
+
+
+def _job_timeout() -> int:
+    """RQ timeout in seconds (``ANALYSIS_JOB_TIMEOUT``, default 6 hours).
+
+    Without a finite timeout a wedged download or GDAL process runs forever and
+    the queue never releases the worker.
+    """
+    raw = os.environ.get("ANALYSIS_JOB_TIMEOUT", "21600")
+    try:
+        timeout = int(float(raw))
+    except (TypeError, ValueError):
+        timeout = 21600
+    return timeout if timeout > 0 else 21600
 
 
 def create_job(kind: str, payload: dict[str, Any]) -> str:
@@ -71,7 +86,7 @@ def create_job(kind: str, payload: dict[str, Any]) -> str:
             kind,
             payload,
             job_id=job_id,
-            job_timeout=-1,
+            job_timeout=_job_timeout(),
             result_ttl=86400,
             failure_ttl=86400,
         )

@@ -60,6 +60,10 @@ def collect_chunked_variable(
                 output_dir=Path(output_dir),
                 temporal_resolution="daily",
                 should_cancel=should_cancel,
+                progress=progress,
+                progress_label=progress_label or variable_id,
+                chunk_index=index,
+                chunk_total=len(chunks),
             ),
         )
         spec = series.spec
