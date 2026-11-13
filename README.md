@@ -55,7 +55,14 @@ backend/backend/
 │   │   └── routes/
 │   │       ├── health.py             # GET /api/v1/health/
 │   │       ├── variables.py          # GET /api/v1/variables/
-│   │       └── analysis.py           # POST /api/v1/analysis/trend
+│   │       ├── analysis.py           # POST /api/v1/analysis/trend
+│   │       ├── comparison.py         # POST /api/v1/analysis/compare/*
+│   │       └── jobs.py               # GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel
+│   ├── jobs/
+│   │   ├── queue.py                  # create/list/cancel + status/result lookup
+│   │   ├── store.py                  # atomic status.json/result.json storage
+│   │   ├── tasks.py                  # RQ worker entrypoint + cancellation checkpoints
+│   │   └── errors.py                 # JobError / JobCanceled / JobNotCancelable
 │   └── services/
 │       ├── earthdata_auth.py         # credential-aware Earthdata login (shared)
 │       ├── modis_processor.py        # Earthdata search/download, GDAL, raster helpers, Egypt CLI
@@ -67,6 +74,7 @@ backend/backend/
 │   └── statistical_methods.md        # methodology rationale and assumptions
 ├── tests/
 │   ├── test_api_analysis.py          # endpoint contract tests
+│   ├── test_api_jobs.py              # job listing, details, cancellation
 │   ├── test_statistical_analysis.py  # statistics unit tests
 │   ├── test_modis_timeseries.py      # collection/aggregation unit tests + integration
 │   ├── test_modis_validation.py      # QA mask / conversion / artifact validation
@@ -183,8 +191,10 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | POST | `/api/v1/analysis/trend` | Queue a trend analysis job for LST, NDVI, precipitation, soil moisture, or air temperature |
 | POST | `/api/v1/analysis/compare/variables` | Queue a background multi-variable comparison job |
 | POST | `/api/v1/analysis/compare/regions` | Queue a background multi-region comparison job |
-| GET | `/api/v1/analysis/jobs/{job_id}` | Job status and progress |
+| GET | `/api/v1/analysis/jobs` | List jobs, newest first, with filters and pagination |
+| GET | `/api/v1/analysis/jobs/{job_id}` | Job status, progress, and the original request |
 | GET | `/api/v1/analysis/jobs/{job_id}/result` | Job result, including base64 charts |
+| POST | `/api/v1/analysis/jobs/{job_id}/cancel` | Cancel a queued or running job (`?force=true` to stop immediately) |
 | GET | `/api/v1/analysis/health` | Analysis service liveness |
 
 
@@ -303,13 +313,52 @@ The result embeds one entry per variable under `variables`, each with `metadata`
 
 The result embeds one entry per region under `regions` (keys `region_1`, `region_2`, ...), each with the same per-variable shape plus its `aoi`. Comparison-level charts are under `comparison.visualizations`: `timeseries_comparison`, `trend_summary`, and `coverage_comparison`, all base64 PNG objects.
 
+#### `GET /api/v1/analysis/jobs`
+
+Lists persisted jobs, newest first. Query parameters: `limit` (default 50, max 200), `offset`, `kind`, and `status` (one value or a comma-separated list, e.g. `queued,started`).
+
+```json
+{
+  "items": [
+    {
+      "job_id": "9c0f...",
+      "kind": "trend_analysis",
+      "status": "started",
+      "percent": 40.0,
+      "created_at": "2026-11-13T06:24:52+00:00",
+      "request": { "variable": "ndvi", "start_date": "2024-01-01", "end_date": "2024-12-31" }
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0,
+  "next": null
+}
+```
+
 #### `GET /api/v1/analysis/jobs/{job_id}`
 
-Returns the persisted status: `queued`, `started`, `finished`, or `failed`, along with `stage`, `label`, `current`, `total`, `percent`, and timestamps. Custom job ids are also RQ job ids, so `rq_status` is included while the job runs.
+Returns the persisted status: `queued`, `started`, `canceling`, `canceled`, `finished`, or `failed`, along with `stage`, `label`, `current`, `total`, `percent`, timestamps, and the original `request`. Custom job ids are also RQ job ids, so `rq_status` is included while the job runs. Unknown ids return `404` without creating a directory.
 
 #### `GET /api/v1/analysis/jobs/{job_id}/result`
 
-Returns the stored result once the job finishes. `409` means still running or already failed; `404` means the job is unknown or no result was written.
+Returns the stored result once the job finishes. `409` means still running or canceled; `404` means the job is unknown or no result was written.
+
+#### `POST /api/v1/analysis/jobs/{job_id}/cancel`
+
+Cancellation is cooperative by default. The endpoint sets `cancel_requested` and moves the job to `canceling`; the worker stops at its next checkpoint (between date chunks, composites, or days), so an in-flight download or `gdal_translate` call is never interrupted half-way.
+
+| Job state | Result |
+| --- | --- |
+| `queued` | Removed from Redis (`Job.cancel()`); status becomes `canceled` |
+| `started` | Status becomes `canceling`; worker writes `canceled` at the next checkpoint |
+| `started` with `?force=true` | RQ is asked to stop the executing horse; status becomes `canceled` immediately |
+| `canceling` / `canceled` | Idempotent `200` |
+| `finished` / `failed` | `409` |
+| Unknown id | `404` |
+| `ANALYSIS_QUEUE_MODE=inline` | `409` — inline jobs run inside the submitting request and cannot be canceled |
+
+If the forced stop command cannot be delivered, the endpoint falls back to cooperative cancellation and leaves the job in `canceling`. A canceled job has no result: `GET .../result` returns `409`.
 
 #### Variable adapters
 

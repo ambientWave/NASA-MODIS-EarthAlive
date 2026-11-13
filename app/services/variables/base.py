@@ -7,6 +7,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
+from app.jobs.errors import raise_if_canceled
+
 
 @dataclass(frozen=True)
 class VariableSpec:
@@ -29,6 +31,16 @@ class CollectionRequest:
     end_date: str
     output_dir: Path
     temporal_resolution: str = "daily"
+    should_cancel: Callable[[], bool] | None = None
+
+    def check_cancel(self) -> None:
+        """Raise ``JobCanceled`` when the owning job has been canceled.
+
+        Collectors call this at coarse checkpoints (per chunk, composite, or
+        day) so an in-flight download or subprocess is never interrupted
+        half-way.
+        """
+        raise_if_canceled(self.should_cancel)
 
 
 @dataclass

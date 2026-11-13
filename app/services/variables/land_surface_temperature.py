@@ -29,6 +29,7 @@ def collect(request: CollectionRequest) -> VariableSeries:
         temporal_aggregation="daily",
         output_dir=request.output_dir,
         region_name="land_surface_temperature",
+        should_cancel=request.should_cancel,
     )
     payload = collect_mod11a1_timeseries(config)
 

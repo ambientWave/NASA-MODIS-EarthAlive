@@ -218,6 +218,7 @@ def collect_daily_grid(
         current = date.fromisoformat(chunk_start)
         chunk_end_date = date.fromisoformat(chunk_end)
         while current <= chunk_end_date:
+            request.check_cancel()
             day = current.isoformat()
             current += timedelta(days=1)
             day_granules = grouped.get(day)

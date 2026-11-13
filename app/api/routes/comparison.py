@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.routes.analysis import AOIRequest, MAX_TOTAL_DAYS, PRODUCT_START_DATE
-from app.jobs import create_job, get_job_result, get_job_status
+from app.jobs import create_job
 from app.services.analysis_engine import SUPPORTED_METHODS
 from app.services.variables import SUPPORTED_VARIABLES
 
@@ -181,32 +181,3 @@ def compare_regions(payload: RegionComparisonRequest) -> dict[str, Any]:
         },
     )
 
-
-@router.get("/jobs/{job_id}")
-def job_status(job_id: str) -> dict[str, Any]:
-    status = get_job_status(job_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-    return status
-
-
-@router.get("/jobs/{job_id}/result")
-def job_result(job_id: str) -> dict[str, Any]:
-    status = get_job_status(job_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-    if status.get("status") == "failed":
-        try:
-            status_code = int(status.get("status_code") or 409)
-        except (TypeError, ValueError):
-            status_code = 409
-        raise HTTPException(
-            status_code=status_code,
-            detail=status.get("error_detail") or status.get("error", "Job failed."),
-        )
-    result = get_job_result(job_id)
-    if result is None:
-        if status.get("status") in {"queued", "started"}:
-            raise HTTPException(status_code=409, detail="Job has not finished yet.")
-        raise HTTPException(status_code=404, detail=f"Result not found for job: {job_id}")
-    return result

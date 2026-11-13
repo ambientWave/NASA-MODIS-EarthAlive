@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+from app.jobs.errors import JobCanceled
 from app.services.analysis_engine import run_series_analysis
 from app.services.comparison_charts import generate_comparison_visualizations
 from app.services.variables import collect_variable, get_variable_spec
@@ -27,6 +28,7 @@ def _collect_chunked(
     output_dir: Path,
     progress: ProgressCallback | None = None,
     progress_label: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], Any, Any]:
     series = collect_chunked_variable(
         variable_id,
@@ -37,6 +39,7 @@ def _collect_chunked(
         max_days=MAX_DAYS_PER_DAILY_JOB,
         progress=progress,
         progress_label=progress_label,
+        should_cancel=should_cancel,
         collector=collect_variable,
     )
     return series.records, series.warnings, series.mean_raster, series.raster_bounds
@@ -46,6 +49,7 @@ def execute_variable_comparison(
     payload: dict[str, Any],
     job_id: str,
     progress: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     aoi = payload["aoi"]
     start_date = payload["start_date"]
@@ -60,6 +64,8 @@ def execute_variable_comparison(
     all_warnings: list[str] = []
 
     for index, variable_id in enumerate(payload["variables"], start=1):
+        if should_cancel is not None and should_cancel():
+            raise JobCanceled()
         spec = get_variable_spec(variable_id)
         output_dir = JOBS_DIR / job_id / variable_id
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +80,7 @@ def execute_variable_comparison(
                 output_dir,
                 progress=progress,
                 progress_label=variable_id,
+                should_cancel=should_cancel,
             )
             analysis = run_series_analysis(
                 records,
@@ -105,6 +112,8 @@ def execute_variable_comparison(
             analysis_by_label[spec.display_name] = analysis
             metadata_by_label[spec.display_name] = {"unit": spec.unit}
             all_warnings.extend(variables[variable_id]["warnings"])
+        except JobCanceled:
+            raise
         except Exception as exc:
             log(f"comparison: variable '{variable_id}' failed: {type(exc).__name__}: {exc}")
             variables[variable_id] = {
@@ -153,6 +162,7 @@ def execute_region_comparison(
     payload: dict[str, Any],
     job_id: str,
     progress: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     variable_id = payload["variable"]
     spec = get_variable_spec(variable_id)
@@ -168,6 +178,8 @@ def execute_region_comparison(
     all_warnings: list[str] = []
 
     for index, aoi in enumerate(payload["regions"], start=1):
+        if should_cancel is not None and should_cancel():
+            raise JobCanceled()
         label = f"region_{index}"
         output_dir = JOBS_DIR / job_id / variable_id / label
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +194,7 @@ def execute_region_comparison(
                 output_dir,
                 progress=progress,
                 progress_label=label,
+                should_cancel=should_cancel,
             )
             analysis = run_series_analysis(
                 records,
@@ -213,6 +226,8 @@ def execute_region_comparison(
             analysis_by_label[label] = analysis
             metadata_by_label[label] = {"unit": spec.unit}
             all_warnings.extend(regions[label]["warnings"])
+        except JobCanceled:
+            raise
         except Exception as exc:
             log(f"comparison: region '{label}' failed: {type(exc).__name__}: {exc}")
             regions[label] = {

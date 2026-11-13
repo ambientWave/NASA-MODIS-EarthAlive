@@ -503,13 +503,51 @@ docker compose run --rm --entrypoint python worker -c "import rq; print(rq.__ver
 
 ---
 
+---
+
+## 2026-11-13 - Job listing, details, and cooperative cancellation
+
+Job state was already persisted as `data/jobs/{job_id}/status.json`, but the API could only fetch a single job's status and result. The original request was not stored at all, there was no list endpoint, and jobs enqueued with `job_timeout=-1` had no way to be stopped.
+
+Changes made:
+
+1. **Request persistence.** `create_job` now writes `"request": payload` into `status.json`, so `GET /api/v1/analysis/jobs/{job_id}` answers "what was this job" without replaying the original POST.
+
+2. **New jobs router.** `app/api/routes/jobs.py` owns `GET /api/v1/analysis/jobs`, `GET /{job_id}`, `GET /{job_id}/result`, and `POST /{job_id}/cancel`. The two old handlers were removed from `comparison.py` and the router is mounted in `main.py`.
+
+3. **Listing.** `GET /api/v1/analysis/jobs` reads each `status.json`, sorts by `created_at` descending, and paginates with `limit` (default 50, max 200) and `offset`. `kind` and `status` filters accept single values; `status` also accepts a comma-separated list (`queued,started`).
+
+4. **Cancellation.**
+   - New statuses/fields: `canceling`, `canceled`, `cancel_requested`, `cancel_requested_at`, `canceled_at`.
+   - `queued` → `rq.job.Job.cancel()` removes it from Redis and records `canceled`.
+   - `started` → sets `cancel_requested` and reports `canceling`; the worker stops at its next checkpoint.
+   - `started` with `?force=true` → `rq.command.send_stop_job_command` stops the executing horse and the API records `canceled`. If the stop command cannot be delivered, it falls back to cooperative cancellation.
+   - `finished`/`failed` → `409`; `inline` mode → `409`; unknown → `404`.
+
+5. **Cooperative checkpoints.** `CollectionRequest` carries an optional `should_cancel` callback and a `check_cancel()` helper. Checks run between date chunks (`collection.py`), between MOD13Q1 composites (`ndvi.py`), per day for remote grids (`remote_grid.py`), and per date for MOD11A1 (`modis_timeseries.py`). Comparison and trend services re-raise `JobCanceled` instead of recording it as a per-variable failure.
+
+6. **Worker semantics.** `run_job` checks the flag before starting, before writing a result, and before marking the job finished, so a cancel that lands while the last analysis step runs still wins. A canceled job writes `canceled` and no `result.json`; `GET .../result` returns `409`.
+
+7. **Store fix.** `status_path`/`result_path` no longer create directories (previously a 404 lookup for an unknown job left an empty directory behind). Only writers call `job_dir()`. Added `iter_statuses()` for listing.
+
+8. **NDVI download visibility.** The MOD13Q1 collector now logs download start/finish with elapsed seconds and megabytes; the 128 MB per-composite download no longer looks like a hung worker.
+
+Verification:
+
+- `pytest tests -m "not integration"`: 96 passed, 2 failed, 3 deselected. The two failures remain the artifact-only Egypt tests.
+- New `tests/test_api_jobs.py` covers listing/filtering/pagination, details with request, the no-directory-on-404 rule, queued/running/forced/inline cancellation, and both cancellation races in `run_job`.
+- `compileall` passes.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".
 - Comparison jobs still need a live run to confirm the GPM/SMAP/MERRA-2 variable names, QA fields, and remote-open behavior.
 - `prune_old_jobs()` is not scheduled; job artifacts accumulate under `data/jobs/`.
 - Live runs of the trend job through Redis are unverified; the unit suite exercises it with `ANALYSIS_QUEUE_MODE=inline`.
-- Trend jobs are still sequential: one Earthdata search per calendar day, no chunking (comparison jobs do chunk at `MAX_DAYS_PER_DAILY_JOB`).
+- Cancellation is cooperative by default, so a running job can take one in-flight download/granule (up to a few minutes) to stop. `?force=true` is the escape hatch, and RQ's kill may leave an orphaned `gdal_translate` or `partial_*` transfer file behind.
+- Jobs are still enqueued with `job_timeout=-1`; cancellation exists, but an abandoned job with nobody watching will run forever. Consider a finite timeout (e.g. 6 hours).
 - The two artifact-dependent tests should move under the `integration` marker (or skip when the files are absent).
 - The sibling `EALive/` tree is a separate codebase from another machine; ignore it rather than keeping it in sync.
 - The unversioned `/health` alias was removed by the `app/main.py` rewrite; decide whether to restore it for external probes or keep only `/api/v1/health/`.

@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from app.jobs.errors import JobError
+from app.jobs.errors import JobError, raise_if_canceled
 from app.jobs.store import JOBS_DIR
 from app.services.analysis_engine import run_series_analysis, to_stats_records
 from app.services.statistical_analysis import validate_time_series
@@ -85,6 +85,7 @@ def execute_trend_analysis(
     payload: dict[str, Any],
     job_id: str,
     progress: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Collect one variable's series and run the requested trend methods."""
     started_at = time.perf_counter()
@@ -115,6 +116,7 @@ def execute_trend_analysis(
             output_dir,
             progress=progress,
             progress_label=variable_id,
+            should_cancel=should_cancel,
         )
     except TimeoutError as exc:
         log(f"trend: job {job_id} collection timed out after {time.perf_counter() - collection_started_at:.1f}s: {exc}")
@@ -172,6 +174,7 @@ def execute_trend_analysis(
 
     if progress is not None:
         progress("analyzing", variable_id, 0, len(requested_methods))
+    raise_if_canceled(should_cancel)
     analysis = run_series_analysis(
         records,
         requested_methods,

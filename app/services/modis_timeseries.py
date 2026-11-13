@@ -6,10 +6,11 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from app.jobs.errors import JobCanceled
 from app.services.modis_processor import (
         PROCESSED_DATA_DIR,
         RAW_DATA_DIR,
@@ -42,6 +43,7 @@ class TimeSeriesConfig:
     output_dir: str | Path | None = None
     cache_path: str | Path | None = None
     region_name: str | None = None
+    should_cancel: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         self.aoi = {
@@ -387,6 +389,8 @@ def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
     )
 
     for index, date_str in enumerate(date_list, start=1):
+        if config.should_cancel is not None and config.should_cancel():
+            raise JobCanceled()
         log_progress("timeseries: date", index, len(date_list), date_str)
         granules = discover_mod11a1_granules(date_str=date_str, bbox=config.aoi)
         if not granules:

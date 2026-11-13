@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.jobs.errors import JobError
-from app.jobs.store import read_status, utc_now, write_result, write_status
+from app.jobs.errors import JobCanceled, JobError, raise_if_canceled
+from app.jobs.store import is_cancel_requested, read_status, utc_now, write_result, write_status
 from app.services.comparison_service import execute_region_comparison, execute_variable_comparison
 from app.services.trend_service import execute_trend_analysis
 from app.utils.logging import log
@@ -13,9 +13,12 @@ from app.utils.logging import log
 
 def _progress(job_id: str, kind: str, stage: str, label: str, current: int, total: int) -> None:
     status = read_status(job_id) or {"job_id": job_id, "kind": kind, "created_at": utc_now()}
+    cancel_requested = is_cancel_requested(job_id)
     status.update(
         {
-            "status": "started",
+            # Keep reporting "canceling" if a cancel arrived while this step ran.
+            "status": "canceling" if cancel_requested else "started",
+            "cancel_requested": cancel_requested,
             "stage": stage,
             "label": label,
             "current": int(current),
@@ -27,6 +30,24 @@ def _progress(job_id: str, kind: str, stage: str, label: str, current: int, tota
     write_status(job_id, status)
 
 
+def _mark_canceled(job_id: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Record a cooperative cancellation without leaving failure metadata."""
+    status = read_status(job_id) or fallback
+    for key in ("error", "error_detail", "status_code"):
+        status.pop(key, None)
+    status.update(
+        {
+            "status": "canceled",
+            "stage": "canceled",
+            "cancel_requested": True,
+            "canceled_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+    )
+    write_status(job_id, status)
+    return status
+
+
 def run_job(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Run one queued analysis job and persist its final result."""
     log(f"jobs: {job_id}: starting {kind}")
@@ -34,18 +55,34 @@ def run_job(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     initial.update({"status": "started", "started_at": utc_now(), "updated_at": utc_now()})
     write_status(job_id, initial)
 
+    def should_cancel() -> bool:
+        return is_cancel_requested(job_id)
+
     def progress(stage: str, label: str, current: int, total: int) -> None:
         _progress(job_id, kind, stage, label, current, total)
 
     try:
+        # A job can be canceled while it waits in the queue.
+        raise_if_canceled(should_cancel)
+
         if kind == "variable_comparison":
-            result = execute_variable_comparison(payload, job_id, progress=progress)
+            result = execute_variable_comparison(
+                payload, job_id, progress=progress, should_cancel=should_cancel
+            )
         elif kind == "region_comparison":
-            result = execute_region_comparison(payload, job_id, progress=progress)
+            result = execute_region_comparison(
+                payload, job_id, progress=progress, should_cancel=should_cancel
+            )
         elif kind == "trend_analysis":
-            result = execute_trend_analysis(payload, job_id, progress=progress)
+            result = execute_trend_analysis(
+                payload, job_id, progress=progress, should_cancel=should_cancel
+            )
         else:
             raise ValueError(f"Unknown job kind: '{kind}'")
+
+        # Check before publishing a result so a cancel that landed while the
+        # last analysis step ran still wins over a successful finish.
+        raise_if_canceled(should_cancel)
 
         write_result(job_id, result)
         status = read_status(job_id) or initial
@@ -62,6 +99,11 @@ def run_job(job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         write_status(job_id, status)
         log(f"jobs: {job_id}: finished")
         return result
+    except JobCanceled as exc:
+        _mark_canceled(job_id, initial)
+        log(f"jobs: {job_id}: canceled: {exc.detail}")
+        # Not a failure: swallow so RQ does not record a traceback.
+        return {"success": False, "canceled": True, "job_id": job_id}
     except JobError as exc:
         status = read_status(job_id) or initial
         status.update(

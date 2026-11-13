@@ -8,6 +8,7 @@ explicit period value, not an interpolated synthetic observation.
 
 from __future__ import annotations
 
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -119,15 +120,24 @@ def collect(request: CollectionRequest) -> VariableSeries:
                 grouped.setdefault(composite_date, []).append(granule)
 
         for composite_date in sorted(grouped):
+            request.check_cancel()
             day_granules = grouped[composite_date]
             log(
                 f"variables: ndvi: composite {composite_date} "
                 f"({len(day_granules)} granule(s), tiles={sorted({granule_tile_id(g) for g in day_granules})})"
             )
+            log(f"variables: ndvi: downloading {len(day_granules)} granule(s) for {composite_date}")
+            download_started_at = time.perf_counter()
             downloaded = download_mod11a1_granules(day_granules, raw_dir)
+            downloaded_mb = sum(Path(path).stat().st_size for path in downloaded if Path(path).exists()) / (1024 * 1024)
+            log(
+                f"variables: ndvi: downloaded {len(downloaded)} granule(s) in "
+                f"{time.perf_counter() - download_started_at:.1f}s ({downloaded_mb:.1f} MB)"
+            )
             if not downloaded:
                 warnings.append(f"{composite_date}: MOD13Q1 granules could not be downloaded.")
                 continue
+            request.check_cancel()
             value, valid, total, used, merged = _composite_mean([Path(p) for p in downloaded], request.aoi, scratch_dir)
             composite_records[composite_date] = {
                 "value": value,

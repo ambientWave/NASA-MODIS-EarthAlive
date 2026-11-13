@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+from app.jobs.errors import JobCanceled
 from app.services.variables import collect_variable
 from app.services.variables.base import CollectionRequest, VariableSeries
 from app.services.variables.remote_grid import date_chunks
@@ -32,6 +33,7 @@ def collect_chunked_variable(
     max_days: int | None = None,
     progress: ProgressCallback | None = None,
     progress_label: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
     collector: Collector = collect_variable,
 ) -> VariableSeries:
     """Collect ``variable_id`` over ``start_date``..``end_date`` in chunks."""
@@ -45,6 +47,9 @@ def collect_chunked_variable(
     spec = None
 
     for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        if should_cancel is not None and should_cancel():
+            raise JobCanceled()
+
         log(f"collection: {variable_id}: chunk {index}/{len(chunks)} {chunk_start} -> {chunk_end}")
         series = collector(
             variable_id,
@@ -54,6 +59,7 @@ def collect_chunked_variable(
                 end_date=chunk_end,
                 output_dir=Path(output_dir),
                 temporal_resolution="daily",
+                should_cancel=should_cancel,
             ),
         )
         spec = series.spec

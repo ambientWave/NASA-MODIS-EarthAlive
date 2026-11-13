@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.api.routes import comparison
+from app.api.routes import comparison, jobs
 from app.main import app
 
 
@@ -77,7 +77,7 @@ def test_compare_regions_rejects_duplicate_aois(monkeypatch):
 
 def test_job_status_and_result_routes(monkeypatch):
     monkeypatch.setattr(
-        comparison,
+        jobs,
         "get_job_status",
         lambda job_id: {
             "job_id": job_id,
@@ -86,7 +86,7 @@ def test_job_status_and_result_routes(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        comparison,
+        jobs,
         "get_job_result",
         lambda job_id: {"success": True, "job_id": job_id, "visualizations": {}},
     )
@@ -102,7 +102,7 @@ def test_job_status_and_result_routes(monkeypatch):
 
 
 def test_result_route_reports_running_job(monkeypatch):
-    monkeypatch.setattr(comparison, "get_job_status", lambda job_id: {"job_id": job_id, "status": "started"})
-    monkeypatch.setattr(comparison, "get_job_result", lambda job_id: None)
+    monkeypatch.setattr(jobs, "get_job_status", lambda job_id: {"job_id": job_id, "status": "started"})
+    monkeypatch.setattr(jobs, "get_job_result", lambda job_id: None)
     response = TestClient(app).get("/api/v1/analysis/jobs/job123/result")
     assert response.status_code == 409

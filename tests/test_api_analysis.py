@@ -42,6 +42,7 @@ def _fake_collect(records):
         max_days=None,
         progress=None,
         progress_label=None,
+        should_cancel=None,
         collector=None,
     ):
         spec = get_variable_spec(variable_id)
