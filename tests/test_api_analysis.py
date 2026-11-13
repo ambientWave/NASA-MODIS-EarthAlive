@@ -6,49 +6,54 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.variables import get_variable_spec
+from app.services.variables.base import VariableSeries
+
+
+def _records(values: list[float]) -> list[dict]:
+    return [
+        {
+            "observation_date": f"2024-{index + 1:02d}-01",
+            "value": value,
+            "valid_pixel_count": 100,
+            "total_pixel_count": 100,
+            "valid_data_percentage": 100.0,
+            "missing": False,
+            "missing_reason": None,
+            "granules_used": [f"g{index}"],
+            "coverage_status": "complete",
+        }
+        for index, value in enumerate(values)
+    ]
 
 
 def _monthly_records() -> list[dict]:
-    records = []
-    for index, month in enumerate(("01", "02", "03", "04")):
-        records.append(
-            {
-                "observation_date": f"2024-{month}-01",
-                "mean_temperature_celsius": 10.0 + index,
-                "minimum_temperature_celsius": 8.0 + index,
-                "maximum_temperature_celsius": 12.0 + index,
-                "valid_pixels": 100,
-                "total_pixels": 100,
-                "valid_data_percentage": 100.0,
-                "missing_observation": False,
-                "missing_reason": None,
-                "granules_used": [f"g{index}"],
-                "coverage_status": "complete",
-            }
-        )
-    return records
+    return _records([10.0, 11.0, 12.0, 13.0])
 
 
 def _fake_collect(records):
-    def collect(config):
-        return {
-            "region_name": config.region_name,
-            "aoi": config.aoi,
-            "start_date": config.start_date,
-            "end_date": config.end_date,
-            "product_short_name": config.product_short_name,
-            "temporal_aggregation": config.temporal_aggregation,
-            "records": records,
-            "output_files": {"csv": "/tmp/example.csv", "json": "/tmp/example.json"},
-            "cache_path": "/tmp/cache.json",
-        }
+    def collect(
+        variable_id,
+        aoi,
+        start_date,
+        end_date,
+        output_dir,
+        *,
+        max_days=None,
+        progress=None,
+        progress_label=None,
+        collector=None,
+    ):
+        spec = get_variable_spec(variable_id)
+        if progress is not None:
+            progress("collecting", progress_label or variable_id, 1, 1)
+        return VariableSeries(spec=spec, records=records)
 
     return collect
 
 
 def _payload(**overrides):
     payload = {
-        "product": "MOD11A1",
         "aoi": {"west": 24.7, "south": 22.0, "east": 36.9, "north": 31.7},
         "start_date": "2024-01-01",
         "end_date": "2024-04-01",
@@ -63,7 +68,7 @@ def _use_inline_jobs(monkeypatch, tmp_path, collect):
     monkeypatch.setattr("app.jobs.queue.QUEUE_MODE", "inline")
     monkeypatch.setattr("app.jobs.store.JOBS_DIR", tmp_path)
     monkeypatch.setattr("app.services.trend_service.JOBS_DIR", tmp_path)
-    monkeypatch.setattr("app.services.trend_service.collect_mod11a1_timeseries", collect)
+    monkeypatch.setattr("app.services.trend_service.collect_chunked_variable", collect)
 
 
 def test_health_endpoint_is_available():
@@ -107,8 +112,43 @@ def test_analysis_trend_is_queued_and_returns_results(monkeypatch, tmp_path):
         assert base64.b64decode(chart["base64"]).startswith(b"\x89PNG")
 
 
+def test_analysis_trend_supports_ndvi_variable(monkeypatch, tmp_path):
+    _use_inline_jobs(monkeypatch, tmp_path, _fake_collect(_records([0.2, 0.3, 0.4, 0.5])))
+    client = TestClient(app)
+
+    response = client.post("/api/v1/analysis/trend", json=_payload(variable="ndvi"))
+    assert response.status_code == 202, response.text
+
+    body = client.get(response.json()["result_url"]).json()
+    assert body["metadata"]["variable"] == "ndvi"
+    assert body["metadata"]["product"] == "MOD13Q1"
+    assert body["metadata"]["unit"] == "NDVI"
+    assert "linear_regression" in body["analysis_results"]
+
+
+def test_analysis_trend_accepts_dataset_short_name_as_product(monkeypatch, tmp_path):
+    _use_inline_jobs(monkeypatch, tmp_path, _fake_collect(_records([0.2, 0.3, 0.4, 0.5])))
+    client = TestClient(app)
+
+    response = client.post("/api/v1/analysis/trend", json=_payload(product="MOD13Q1"))
+    assert response.status_code == 202, response.text
+
+    body = client.get(response.json()["result_url"]).json()
+    assert body["metadata"]["variable"] == "ndvi"
+    assert body["metadata"]["product"] == "MOD13Q1"
+
+
+def test_analysis_trend_rejects_conflicting_variable_and_product():
+    response = TestClient(app).post(
+        "/api/v1/analysis/trend",
+        json=_payload(variable="ndvi", product="MOD11A1"),
+    )
+    assert response.status_code == 400
+    assert "different variables" in response.json()["detail"]
+
+
 def test_analysis_trend_reports_missing_gdal_as_service_unavailable(monkeypatch, tmp_path):
-    def fake_collect(config):
+    def fake_collect(*args, **kwargs):
         raise RuntimeError(
             "gdal_translate was not found. MOD11A1 HDF4 subdatasets need GDAL built with the HDF4 driver."
         )
@@ -135,13 +175,11 @@ def test_analysis_trend_surfaces_missing_reasons_for_empty_series(monkeypatch, t
     records = [
         {
             "observation_date": "2024-01-01",
-            "mean_temperature_celsius": None,
-            "minimum_temperature_celsius": None,
-            "maximum_temperature_celsius": None,
-            "valid_pixels": 0,
-            "total_pixels": 1000,
+            "value": None,
+            "valid_pixel_count": 0,
+            "total_pixel_count": 1000,
             "valid_data_percentage": 0.0,
-            "missing_observation": True,
+            "missing": True,
             "missing_reason": "No granules found for the AOI on this date.",
             "granules_used": [],
             "coverage_status": "missing",

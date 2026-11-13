@@ -9,8 +9,7 @@ from typing import Any, Callable
 from app.services.analysis_engine import run_series_analysis
 from app.services.comparison_charts import generate_comparison_visualizations
 from app.services.variables import collect_variable, get_variable_spec
-from app.services.variables.base import CollectionRequest
-from app.services.variables.remote_grid import date_chunks
+from app.services.variables.collection import collect_chunked_variable
 from app.utils.logging import log
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -18,19 +17,6 @@ JOBS_DIR = PROJECT_ROOT / "data" / "jobs"
 MAX_DAYS_PER_DAILY_JOB = int(os.environ.get("MAX_DAYS_PER_DAILY_JOB", "1826"))
 
 ProgressCallback = Callable[[str, str, int, int], None]
-
-
-def _chunks(start_date: str, end_date: str) -> list[tuple[str, str]]:
-    return date_chunks(start_date, end_date, MAX_DAYS_PER_DAILY_JOB)
-
-
-def _merge_records(variable_id: str, chunk_records: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-    for records in chunk_records:
-        for record in records:
-            merged[str(record["observation_date"])] = record
-    log(f"comparison: {variable_id}: merged {len(merged)} daily record(s)")
-    return [merged[day] for day in sorted(merged)]
 
 
 def _collect_chunked(
@@ -42,31 +28,18 @@ def _collect_chunked(
     progress: ProgressCallback | None = None,
     progress_label: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], Any, Any]:
-    chunks = _chunks(start_date, end_date)
-    records_by_chunk: list[list[dict[str, Any]]] = []
-    warnings: list[str] = []
-    mean_raster = None
-    raster_bounds = None
-    for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        log(f"comparison: {variable_id}: chunk {index}/{len(chunks)} {chunk_start} -> {chunk_end}")
-        series = collect_variable(
-            variable_id,
-            CollectionRequest(
-                aoi=aoi,
-                start_date=chunk_start,
-                end_date=chunk_end,
-                output_dir=output_dir,
-                temporal_resolution="daily",
-            ),
-        )
-        records_by_chunk.append(series.records)
-        warnings.extend(series.warnings)
-        if series.mean_raster is not None:
-            mean_raster = series.mean_raster
-            raster_bounds = series.raster_bounds
-        if progress is not None:
-            progress("collecting", progress_label or variable_id, index, len(chunks))
-    return _merge_records(variable_id, records_by_chunk), warnings, mean_raster, raster_bounds
+    series = collect_chunked_variable(
+        variable_id,
+        aoi,
+        start_date,
+        end_date,
+        output_dir,
+        max_days=MAX_DAYS_PER_DAILY_JOB,
+        progress=progress,
+        progress_label=progress_label,
+        collector=collect_variable,
+    )
+    return series.records, series.warnings, series.mean_raster, series.raster_bounds
 
 
 def execute_variable_comparison(

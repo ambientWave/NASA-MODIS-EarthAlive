@@ -44,8 +44,11 @@ ENV PATH=/opt/gdal/bin:$PATH \
 WORKDIR /srv/backend/backend
 
 COPY requirements.txt ./
+# The import check fails the build immediately if the queue/raster stack did
+# not install, instead of surfacing as "exec rq failed" at container start.
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt
+    && python -m pip install -r requirements.txt \
+    && python -c "import rq, redis, h5netcdf, h5py, rasterio; print('analysis deps OK')"
 
 COPY app ./app
 COPY pytest.ini ./

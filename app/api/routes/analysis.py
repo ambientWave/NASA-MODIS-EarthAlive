@@ -7,11 +7,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.jobs import create_job
+from app.services.variables import resolve_variable_id
 from app.utils.logging import log
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 
-SUPPORTED_PRODUCTS = {"MOD11A1"}
 SUPPORTED_TEMPORAL_RESOLUTION = {"daily", "monthly", "yearly"}
 SUPPORTED_ANALYSIS_METHODS = {
     "linear_regression",
@@ -33,7 +33,22 @@ class AOIRequest(BaseModel):
 
 
 class TrendAnalysisRequest(BaseModel):
-    product: str = Field("MOD11A1", description="Satellite product short name.", examples=["MOD11A1"])
+    variable: str | None = Field(
+        None,
+        description=(
+            "Variable to analyze: land_surface_temperature (LST), ndvi, precipitation, "
+            "soil_moisture, or air_temperature. Defaults to land_surface_temperature."
+        ),
+        examples=["ndvi"],
+    )
+    product: str | None = Field(
+        None,
+        description=(
+            "Deprecated alias for `variable`. Accepts a dataset short name such as MOD11A1, "
+            "MOD13Q1, GPM_3IMERGD, SPL3SMP_E, or M2SDNXSLV."
+        ),
+        examples=["MOD11A1"],
+    )
     aoi: AOIRequest = Field(..., description="Geographic bounding box for the AOI.")
     start_date: str = Field(..., description="Analysis start date in ISO format YYYY-MM-DD.", examples=["2024-01-01"])
     end_date: str = Field(..., description="Analysis end date in ISO format YYYY-MM-DD.", examples=["2024-12-31"])
@@ -70,11 +85,37 @@ def _parse_iso_date(value: str, field_name: str) -> date:
         ) from exc
 
 
+def _resolve_variable(payload: TrendAnalysisRequest) -> str:
+    """Resolve `variable` / deprecated `product` into one canonical variable id."""
+    try:
+        if payload.variable is not None:
+            from_variable = resolve_variable_id(payload.variable)
+        else:
+            from_variable = None
+
+        if payload.product is not None:
+            from_product = resolve_variable_id(payload.product)
+        else:
+            from_product = None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if from_variable and from_product and from_variable != from_product:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"`variable` ('{payload.variable}') and `product` ('{payload.product}') "
+                "refer to different variables; send only one."
+            ),
+        )
+    return from_variable or from_product or "land_surface_temperature"
+
+
 @router.post(
     "/trend",
     status_code=202,
     response_model=JobAcceptedResponse,
-    summary="Queue a MODIS LST trend analysis for a user-defined AOI.",
+    summary="Queue a trend analysis for one environmental variable and AOI.",
     responses={
         202: {
             "description": "Trend analysis job accepted.",
@@ -94,12 +135,7 @@ def _parse_iso_date(value: str, field_name: str) -> date:
     },
 )
 def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
-    product = str(payload.product).upper()
-    if product not in SUPPORTED_PRODUCTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported product: '{payload.product}'. Supported products: {sorted(SUPPORTED_PRODUCTS)}",
-        )
+    variable_id = _resolve_variable(payload)
 
     start_date = _parse_iso_date(payload.start_date, "start_date")
     end_date = _parse_iso_date(payload.end_date, "end_date")
@@ -108,7 +144,7 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
     if start_date < PRODUCT_START_DATE:
         raise HTTPException(
             status_code=400,
-            detail=f"start_date must be on or after {PRODUCT_START_DATE.isoformat()} (MOD11A1 v061 data coverage start).",
+            detail=f"start_date must be on or after {PRODUCT_START_DATE.isoformat()} (earliest supported data coverage start).",
         )
     if (end_date - start_date).days + 1 > MAX_TOTAL_DAYS:
         raise HTTPException(status_code=400, detail=f"Date range exceeds the {MAX_TOTAL_DAYS}-day maximum.")
@@ -137,7 +173,7 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="At least one analysis method is required.")
 
     job_payload = {
-        "product": product,
+        "variable": variable_id,
         "aoi": aoi,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
@@ -147,7 +183,7 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
 
     log(
         "trend: request accepted "
-        f"product={product} aoi={aoi} start={start_date} end={end_date} "
+        f"variable={variable_id} aoi={aoi} start={start_date} end={end_date} "
         f"resolution={temporal_resolution} methods={requested_methods}"
     )
     try:

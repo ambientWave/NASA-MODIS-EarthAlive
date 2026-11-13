@@ -143,10 +143,18 @@ docker compose up --build
 ```
 
 - `./app` is bind-mounted for reload; `./data` is bind-mounted so downloads and artifacts persist on the host.
+- Three services: `redis`, `api`, and `worker`. The worker runs `python -m rq.cli worker --url redis://redis:6379/0 analysis` so it does not depend on the pip console-script PATH.
 - `.env` is injected through `env_file` (missing file is tolerated).
 - Health is polled through `curl` against `/api/v1/health/`.
 - The image mirrors the local layout (`/srv/backend/backend/app`) so project-rooted data paths resolve to `/srv/backend/data`.
-- The build asserts HDF4 support with `gdalinfo --formats | grep -qi hdf4`, so a broken GDAL fails the build instead of at request time.
+- The build asserts HDF4 support with `gdalinfo --formats | grep -qi hdf4` and imports `rq`/`redis` after installing requirements, so both GDAL and queue problems fail the build instead of container startup.
+
+Compose reuses an existing `earth-alive-api:dev` image by default. After changing `requirements.txt` or the `Dockerfile`, force a rebuild:
+
+```powershell
+docker compose build --no-cache
+docker compose up
+```
 
 **Why this split:** Alpine's `gdal` has no HDF4 driver, and Debian/Ubuntu package no HDF4-enabled GDAL (`libgdal-hdf4` does not exist there). Installing conda's `gdal` package would drag in conda's own Python, whose version is decided by the solver. So the image takes Python 3.14 from the official image and installs only `libgdal-core` + `libgdal-hdf4` from conda-forge — no Python dependency, no version substitution.
 
@@ -172,7 +180,7 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/api/v1/health/` | Health check |
 | GET | `/api/v1/variables/` | List supported environmental variables (static metadata) |
 | GET | `/api/v1/variables/{variable_id}` | Single variable metadata |
-| POST | `/api/v1/analysis/trend` | Queue a MODIS LST acquisition + trend analysis job |
+| POST | `/api/v1/analysis/trend` | Queue a trend analysis job for LST, NDVI, precipitation, soil moisture, or air temperature |
 | POST | `/api/v1/analysis/compare/variables` | Queue a background multi-variable comparison job |
 | POST | `/api/v1/analysis/compare/regions` | Queue a background multi-region comparison job |
 | GET | `/api/v1/analysis/jobs/{job_id}` | Job status and progress |
@@ -186,7 +194,7 @@ Request body:
 
 ```json
 {
-  "product": "MOD11A1",
+  "variable": "ndvi",
   "aoi": { "west": 24.7, "south": 22.0, "east": 36.9, "north": 31.7 },
   "start_date": "2024-01-01",
   "end_date": "2024-12-31",
@@ -195,9 +203,14 @@ Request body:
 }
 ```
 
+- `variable`: `land_surface_temperature` (LST), `ndvi`, `precipitation`, `soil_moisture`, or `air_temperature`. Aliases such as `LST`, `MOD11A1`, `MOD13Q1`, `GPM`, `SMAP`, and `MERRA` are accepted.
+- `product`: deprecated alias for `variable`; a dataset short name (`MOD11A1`, `MOD13Q1`, `GPM_3IMERGD`, `SPL3SMP_E`, `M2SDNXSLV`). If both are sent they must resolve to the same variable.
+- If neither is sent, the endpoint defaults to `land_surface_temperature`.
 - `temporal_resolution`: `daily` | `monthly` | `yearly`
 - `analysis_methods`: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`
 - `start_date` must be on or after `2000-02-24`; the range is capped at `366 * 30` days.
+- `monthly` and `yearly` aggregate the daily variable records to period means. Precipitation stays a mean daily rate (`mm/day`) rather than a monthly total, so all variables use the same statistic.
+- NDVI daily records are MOD13Q1 16-day period values carried forward across their window (`source_frequency: "16-day"`, `coverage_status: "period_value"`).
 
 The route validates the request and enqueues a `trend_analysis` job, returning `202`:
 
@@ -216,7 +229,7 @@ Poll `status_url`, then fetch the result envelope from `result_url`:
 {
   "success": true,
   "job_id": "9c0f...",
-  "metadata": { "mode": "trend_analysis", "product": "...", "temporal_resolution": "...", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
+  "metadata": { "mode": "trend_analysis", "variable": "ndvi", "display_name": "Vegetation Index (NDVI)", "product": "MOD13Q1", "unit": "NDVI", "native_resolution": "16-day", "temporal_resolution": "monthly", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
   "data_quality": { "observation_count": 12, "valid_observation_count": 12, "missing_observation_percentage": 0.0, "data_coverage_percentage": 98.3, "warnings": [] },
   "analysis_results": { "linear_regression": {}, "mann_kendall": {} },
   "visualizations": {
@@ -357,7 +370,7 @@ All analysis work is asynchronous.
 1. Pydantic validates `TrendAnalysisRequest` (literal enums, coordinate ranges) → 422 on malformed input.
 2. The handler re-validates the same constraints manually, plus the coverage start and maximum range → 400.
 3. `create_job` writes `data/jobs/{job_id}/status.json` and enqueues `app.jobs.tasks.run_job` on the `analysis` RQ queue → `202` with `job_id`, `status_url`, `result_url`.
-4. The worker calls `execute_trend_analysis` (`app/services/trend_service.py`), which builds `TimeSeriesConfig` (AOI ordering, product whitelist, aggregation) and runs the acquisition loop. **One Earthdata search per calendar day**, plus downloads and two `gdal_translate` subprocesses per granule.
+4. The worker calls `execute_trend_analysis` (`app/services/trend_service.py`), which resolves the requested variable, collects it through the shared registry/chunking helper, and aggregates daily records to monthly/yearly means when needed. MOD11A1 still searches **one Earthdata query per calendar day**, plus downloads and two `gdal_translate` subprocesses per granule; the other adapters use their product-specific collectors.
 5. `_as_stats_records` (`trend_service.py`) translates between the collector and statistics vocabularies (see [Data schemas](#data-schemas)).
 6. `validate_time_series` parses dates, rejects duplicates, separates missing observations, and computes coverage warnings.
 7. Requested methods are dispatched inline in the worker.
@@ -526,7 +539,7 @@ Coverage map:
 | `test_modis_timeseries.py` | Date ranges, missing records, pixel summaries, granule cache, monthly aggregation, CSV/JSON output |
 | `test_modis_validation.py` | QA bit masking, LST validity, Kelvin conversion, artifact CRS/bounds, report fields |
 | `test_global_aoi.py` | Dynamic AOI definitions and multi-region pipeline behavior |
-| `test_api_analysis.py` | Health endpoint, trend job submission, inline job status/result, worker error replay, invalid AOI/date/range rejection |
+| `test_api_analysis.py` | Health endpoint, trend job submission, LST/NDVI variable selection and aliases, inline job status/result, worker error replay, invalid AOI/date/range rejection |
 | `test_comparison.py` | Variable registry, generic stats adapter, base64 charts, date chunking, variable/region execution |
 | `test_api_comparison.py` | Comparison job submission, validation guards (variables, dates, duplicate AOIs), status/result routes |
 | `test_encoding.py` | Base64 helper round-trips for bytes and files |

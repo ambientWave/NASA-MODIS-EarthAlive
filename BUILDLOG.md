@@ -343,7 +343,7 @@ BullMQ is a Node.js library; using it would add a second runtime and JavaScript 
 
 ```yaml
 worker:
-  command: ["rq", "worker", "--url", "redis://redis:6379/0", "analysis"]
+  command: ["python", "-m", "rq.cli", "worker", "--url", "redis://redis:6379/0", "analysis"]
 ```
 
 `docker-compose.yml` now has three services: `redis` (append-only, healthcheck), `api`, and `worker`. Both `api` and `worker` share the bind-mounted `./data` volume so the worker's output is immediately visible to the API.
@@ -380,6 +380,26 @@ The legacy `POST /analysis/trend` route used to run the entire acquisition and a
 - The result includes `metadata.output_files` and the same base64 charts as before.
 - Worker failures store `status_code` and `error_detail`. `GET /jobs/{job_id}/result` replays that status: a missing GDAL still returns `503`, an empty series still returns `404`, and a timeout still returns `504`.
 - `ANALYSIS_QUEUE_MODE=inline` runs the job in-process for tests; failures are recorded in the job files rather than raised from the submit call, so the `202` + result-fetch flow is identical to Redis mode.
+
+### Trend endpoint expanded to all variables
+
+`POST /analysis/trend` no longer assumes MOD11A1. It now accepts `variable`:
+
+- `land_surface_temperature` / `LST`
+- `ndvi`
+- `precipitation`
+- `soil_moisture`
+- `air_temperature`
+
+The deprecated `product` field still works with dataset short names (`MOD11A1`, `MOD13Q1`, `GPM_3IMERGD`, `SPL3SMP_E`, `M2SDNXSLV`). If both fields are sent they must resolve to the same variable, otherwise the route returns `400`. With neither, the endpoint defaults to LST for backward compatibility.
+
+Implementation:
+
+- `resolve_variable_id` in `app/services/variables/__init__.py` maps ids, aliases, and dataset names to canonical variable ids.
+- The trend worker collects through the same registry as the comparison jobs, then aggregates daily records to monthly/yearly means. Precipitation stays `mm/day` (period mean), not a monthly total.
+- `app/services/variables/collection.py` now owns the chunk/merge loop shared by comparison and trend jobs. Comparison services pass their existing `MAX_DAYS_PER_DAILY_JOB`; trend uses the default.
+- Analysis goes through the shared `analysis_engine.run_series_analysis`, so every variable gets the same method dispatch, data-quality summary, and base64 charts. Results include `metadata.variable`, `display_name`, `unit`, and `native_resolution`.
+- NDVI keeps its explicit 16-day period-value semantics; monthly/yearly aggregation is applied on top of those daily period rows.
 
 ### Variable adapters
 
@@ -430,11 +450,56 @@ All charts are `{"content_type": "image/png", "base64": "..."}` using `app/utils
 
 ### Verification
 
-- `pytest tests -m "not integration"`: 79 passed, 2 failed, 3 deselected.
+- `pytest tests -m "not integration"`: 82 passed, 2 failed, 3 deselected.
 - Both failures are artifact-only (`test_final_egypt_raster_is_wgs84_and_cropped_to_aoi`, `test_report_contains_required_scientific_summary_fields`) because `data/processed/egypt/*` does not exist in this checkout.
 - `docker compose config --quiet` passes.
 - Live Earthdata runs and the worker inside the container were **not** verified here; Earthdata credentials and remote access are required.
 - Actual NDVI/GPM/SMAP/MERRA-2 variable names and QA fields are based on product documentation, not validated against downloaded granules.
+
+---
+
+## 2026-11-13 - Worker startup: `exec rq failed: No such file or directory`
+
+The worker container exited with code 127 immediately after Compose started it:
+
+```text
+earth-alive-worker  | [FATAL tini (7)] exec rq failed: No such file or directory
+```
+
+Exit 127 means the container runtime could not find the `rq` executable, not that RQ crashed. Two causes were possible: a stale image built before `rq` was added to `requirements.txt`, or the pip console-script directory not being on `PATH`.
+
+Changes made:
+
+1. Compose no longer depends on the console script:
+
+   ```yaml
+   command: ["python", "-m", "rq.cli", "worker", "--url", "redis://redis:6379/0", "analysis"]
+   ```
+
+   `python -m` resolves the installed `rq` package directly, so it works even when `/usr/local/bin/rq` is missing or PATH differs.
+
+2. The Dockerfile now asserts the analysis stack imported successfully right after installation:
+
+   ```dockerfile
+   RUN python -m pip install --upgrade pip \
+       && python -m pip install -r requirements.txt \
+       && python -c "import rq, redis, h5netcdf, h5py, rasterio; print('analysis deps OK')"
+   ```
+
+   A missing or unreadable requirement now fails the build instead of container startup.
+
+3. `docker compose up` reuses an existing `earth-alive-api:dev` image by default. Rebuild without cache after dependency or Dockerfile changes:
+
+   ```powershell
+   docker compose build --no-cache
+   docker compose up
+   ```
+
+If the worker still fails after a forced rebuild, the next check inside the image is:
+
+```powershell
+docker compose run --rm --entrypoint python worker -c "import rq; print(rq.__version__)"
+```
 
 ---
 

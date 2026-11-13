@@ -58,7 +58,10 @@ services:
       dockerfile: Dockerfile
     image: earth-alive-api:dev
     container_name: earth-alive-worker
-    command: ["rq", "worker", "--url", "redis://redis:6379/0", "analysis"]
+    # Use the module entry point instead of the `rq` console script: console
+    # scripts depend on the pip scripts directory being on PATH, while
+    # `python -m` only needs the installed package.
+    command: ["python", "-m", "rq.cli", "worker", "--url", "redis://redis:6379/0", "analysis"]
     env_file:
       - path: .env
         required: false
