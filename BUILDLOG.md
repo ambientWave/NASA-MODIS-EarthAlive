@@ -637,6 +637,89 @@ per composite" came from a job whose AOI fit inside one tile.
 
 ---
 
+## 2026-11-13 - Comparisons fan out across workers; download progress in job status
+
+### Distributed comparisons
+
+A comparison job used to run variable after variable (or region after region)
+inside a single RQ worker, so a second replica sat idle even with three or five
+independent parts to do.
+
+A comparison with more than one part is now split at enqueue time:
+
+- `app/jobs/queue.py` creates one RQ job per variable (variable comparison) or
+  per region (region comparison), with ids `{job_id}-p{index}`. A single-part
+  comparison keeps the old `run_job` path.
+- `app/jobs/tasks.py:run_comparison_part` runs one part and writes
+  `data/jobs/{job_id}/parts/{index}.json` plus `{index}.status.json`.
+- Parts never write the parent `status.json` blindly. They re-read all part
+  status files and recompute the aggregate (`_refresh_parent_progress`), and
+  the parent percent is clamped to be monotonic.
+- An atomic Redis `INCR` (`analysis:parts:{job_id}`) detects the last part.
+  That worker calls `assemble_variable_comparison` / `assemble_region_comparison`
+  and publishes `result.json` — no worker is reserved for coordination.
+- `comparison_service.py` now exposes `variable_part`, `region_part`, and the
+  two assemblers. The sequential executors use exactly the same builders and
+  assemblers, so inline mode and single-part results are unchanged.
+- A delayed `finalize_comparison_watchdog` job (`job_timeout + 120` seconds)
+  fails the parent with a clear message if a part was killed by the RQ timeout
+  and never produced a result.
+- `cancel_job` understands fan-out: queued parts are removed from Redis,
+  running parts are stopped only with `?force=true`, and the parent settles to
+  `canceled` once every part has stopped.
+
+### Download progress is visible in the API
+
+The NDVI heartbeat previously only reached worker logs. `download_granules`
+now accepts an `on_progress(elapsed, bytes)` callback; the NDVI collector maps
+it into the parent job's label, so status looks like:
+
+```json
+{ "stage": "collecting", "label": "ndvi downloading composites 2023-01-01..2023-01-17… 45s elapsed, 87.2 MB", "percent": 8.7 }
+```
+
+The callback is wrapped so a failed status write can never abort a download.
+
+### Two bugs the live run exposed
+
+1. **`earthaccess` needs a login for `download` and `open`, not for `search_data`.**
+   A live NDVI job searched successfully, then every download failed with
+   "You must call earthaccess.login() before you can download data"; the old
+   code logged that and continued with zero granules. The NDVI collector now
+   calls `ensure_earthaccess_auth()` once per job, and `download_granules`
+   raises `RuntimeError` when none of the requested granules arrive instead of
+   producing an empty series that later looks like "no valid observations".
+   `collect_daily_grid` got the same login call, which fixes MERRA-2
+   (`air_temperature`) parts failing with
+   `'NoneType' object has no attribute 'open'`.
+2. **The shared cache was not shared.** `app/utils/cache.py` anchored its
+   default at `parents[2]`, one directory above `app/jobs/store.py`'s
+   `parents[3]`. In the container that put downloads in
+   `/srv/backend/backend/data/cache` inside the image instead of the
+   `/srv/backend/data` bind mount, so the host never saw them and the second
+   replica could not reuse them. It now uses the same `parents[3]` anchor, and
+   the container check prints `/srv/backend/data/cache` with a 536870912-byte
+   budget.
+
+### Verification
+
+- Live fan-out run (`variable_comparison`, 3 variables, 2 days of data):
+  `ndvi` ran on `worker-1` while `precipitation` then `air_temperature` ran on
+  `worker-2`; the last part assembled the result. Parent status moved
+  `1/3 part(s) finished — ndvi` → `finished`, and `result.json` contains all
+  three variables plus the three comparison charts.
+- A second NDVI wave logged `already cached 8 granule(s)` and
+  `cache: reclaimed 41.1 MB`, confirming AOI reuse and LRU trimming against the
+  0.5 GB budget.
+- `pytest tests -m "not integration"`: 119 passed, 2 failed, 3 deselected (the
+  two artifact-only Egypt tests).
+- New `tests/test_job_fanout.py` covers part labels, fan-out enqueueing,
+  single-part fallback, per-worker part execution, last-part assembly, the
+  watchdog failure path, cancellation of queued parts, and monotonic parent
+  progress.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".

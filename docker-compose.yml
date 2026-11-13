@@ -37,7 +37,7 @@ services:
       ANALYSIS_QUEUE_MODE: "redis"
       REDIS_URL: "redis://redis:6379/0"
       # Shared cache for downloaded granules and AOI rasters (bounded LRU).
-      ANALYSIS_CACHE_GB: "0.5"
+      ANALYSIS_CACHE_GB: "1.0"
       ANALYSIS_JOB_TIMEOUT: "21600"
     volumes:
       # Live source for uvicorn --reload.
@@ -76,7 +76,7 @@ services:
       GDAL_WARP: "/opt/gdal/bin/gdalwarp"
       ANALYSIS_QUEUE_MODE: "redis"
       REDIS_URL: "redis://redis:6379/0"
-      ANALYSIS_CACHE_GB: "0.5"
+      ANALYSIS_CACHE_GB: "1.0"
       ANALYSIS_JOB_TIMEOUT: "21600"
     volumes:
       - ./app:/srv/backend/backend/app

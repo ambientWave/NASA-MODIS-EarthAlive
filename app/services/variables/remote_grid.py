@@ -16,6 +16,7 @@ import xarray as xr
 
 import earthaccess
 
+from app.services.earthdata_auth import ensure_earthaccess_auth
 from app.services.variables.base import CollectionRequest, VariableSeries, VariableSpec, build_record
 from app.utils.logging import log
 
@@ -189,6 +190,10 @@ def collect_daily_grid(
     search_chunk_days: int = 366,
 ) -> VariableSeries:
     """Collect a daily AOI mean from a remotely-readable global grid product."""
+    # ``earthaccess.open`` needs an initialised store; search alone does not
+    # create one, so a worker that only reads remote granules would fail with
+    # "'NoneType' object has no attribute 'open'".
+    ensure_earthaccess_auth()
     variable_names = tuple(variable_names)
     start = date.fromisoformat(request.start_date)
     end = date.fromisoformat(request.end_date)

@@ -58,6 +58,13 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def redis_connection():
+    """Redis client used for the queue and comparison part counters."""
+    from redis import Redis
+
+    return Redis.from_url(REDIS_URL)
+
+
 def write_status(job_id: str, payload: dict[str, Any]) -> None:
     job_dir(job_id)
     if is_cancel_requested(job_id) and not payload.get("cancel_requested"):

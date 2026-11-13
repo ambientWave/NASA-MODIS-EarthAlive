@@ -63,7 +63,7 @@ backend/backend/
 │   ├── jobs/
 │   │   ├── queue.py                  # create/list/cancel + status/result lookup
 │   │   ├── store.py                  # atomic status.json/result.json storage
-│   │   ├── tasks.py                  # RQ worker entrypoint + cancellation checkpoints
+│   │   ├── tasks.py                  # RQ worker entrypoints, cancellation, comparison fan-out
 │   │   └── errors.py                 # JobError / JobCanceled / JobNotCancelable
 │   └── services/
 │       ├── earthdata_auth.py         # credential-aware Earthdata login (shared)
@@ -77,6 +77,7 @@ backend/backend/
 ├── tests/
 │   ├── test_api_analysis.py          # endpoint contract tests
 │   ├── test_api_jobs.py              # job listing, details, cancellation
+│   ├── test_job_fanout.py            # comparison parts, assembly, watchdog, cancel
 │   ├── test_ndvi_cache.py            # NDVI waves, AOI cache, atomic writes, LRU trim
 │   ├── test_statistical_analysis.py  # statistics unit tests
 │   ├── test_modis_timeseries.py      # collection/aggregation unit tests + integration
@@ -275,6 +276,8 @@ Work runs in an RQ worker backed by Redis (`ANALYSIS_QUEUE_MODE=redis`). Set `AN
 
 Compose starts **two workers by default** (`deploy.replicas: 2`) so a download-bound job does not block a compute-bound one. Scale with `docker compose up -d --scale worker=4`. Worker jobs are capped by `ANALYSIS_JOB_TIMEOUT` (default `21600` seconds, six hours) so a wedged download fails instead of holding the worker forever. The job store, cancellation marker, and shared cache are all files under `./data`, so replicas coordinate without extra infrastructure.
 
+Comparison jobs use every idle worker: a request with N variables (or N regions) is enqueued as N independent part jobs. Each part writes its own result under `data/jobs/{job_id}/parts/`; the last part to finish is detected with an atomic Redis counter and assembles the comparison, so no worker is parked waiting for the others. A delayed watchdog job settles the parent if a part is killed hard by the RQ timeout.
+
 Supported variables: `land_surface_temperature`, `ndvi`, `precipitation`, `soil_moisture`, `air_temperature`. Supported methods: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`. Only `temporal_resolution: "daily"` is accepted.
 
 Shared guards:
@@ -299,6 +302,8 @@ Shared guards:
 ```
 
 The result embeds one entry per variable under `variables`, each with `metadata`, `series`, `data_quality`, `analysis_results`, per-method `visualizations`, `status`, and `warnings`. A variable that fails is marked `status: "failed"` with an `error` and does not abort the rest of the job.
+
+With two or more variables, each variable is collected and analysed as a separate RQ part, so the parts run concurrently on different worker replicas. The parent job reports combined progress (`label: "1/3 part(s) finished — ndvi"`, `percent` = mean of part progress) and produces the same result document as the sequential path.
 
 #### `POST /api/v1/analysis/compare/regions`
 
@@ -397,7 +402,13 @@ modis: downloaded 8 granule(s) in 128.4s (479.6 MB) for 2023-01-01..2023-01-17 (
 variables: ndvi: already cached 4 granule(s) for 2023-02-02
 ```
 
-Job status reports per-composite progress instead of sitting at a chunk boundary:
+Job status mirrors the download heartbeat, so the API shows progress without reading logs:
+
+```json
+{ "stage": "collecting", "label": "ndvi downloading composites 2023-01-01..2023-01-17… 45s elapsed, 87.2 MB", "percent": 8.7 }
+```
+
+Once a wave is local, status switches to per-composite progress instead of sitting at a chunk boundary:
 
 ```json
 { "stage": "collecting", "label": "ndvi composite 2023-03-06 (5/23)", "current": 5, "total": 23, "percent": 21.74 }
@@ -460,6 +471,8 @@ All analysis work is asynchronous.
 ### 2. Comparison jobs (`/compare/variables`, `/compare/regions`)
 
 Same job lifecycle, but `execute_variable_comparison` / `execute_region_comparison` (`app/services/comparison_service.py`) run the variable adapters in `app/services/variables/`. Long date ranges are chunked at `MAX_DAYS_PER_DAILY_JOB`, merged by observation date, then analyzed through the shared `app/services/analysis_engine.py`.
+
+In Redis mode a comparison with more than one part is split by `app/jobs/queue.py` into one `run_comparison_part` job per variable or region. Parts write `parts/{index}.json` and `parts/{index}.status.json` under the parent job directory, so the API process, the part workers, and the assembler only share files. Progress updates re-read those files to keep the parent percentage monotonic. When the Redis counter reaches the part count, the finishing worker calls the same assemblers the inline path uses (`assemble_variable_comparison` / `assemble_region_comparison`), writes `result.json`, and marks the job `finished`. Cancelling the parent stops its queued parts and lets running parts stop at their next checkpoint.
 
 ### 3. Full statistics orchestrator (not wired to the API)
 

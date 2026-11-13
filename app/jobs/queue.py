@@ -4,27 +4,28 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from app.jobs.errors import JobNotCancelable
 from app.jobs.store import (
     QUEUE_MODE,
     QUEUE_NAME,
-    REDIS_URL,
     iter_statuses,
     mark_cancel_requested,
     read_result,
     read_status,
+    redis_connection,
     utc_now,
     write_status,
 )
 from app.utils.logging import log
 
+COMPARISON_KINDS = {"variable_comparison", "region_comparison"}
+
 
 def _redis_connection():
-    from redis import Redis
-
-    return Redis.from_url(REDIS_URL)
+    return redis_connection()
 
 
 def _job_timeout() -> int:
@@ -41,11 +42,24 @@ def _job_timeout() -> int:
     return timeout if timeout > 0 else 21600
 
 
+def comparison_part_labels(kind: str, payload: dict[str, Any]) -> list[str]:
+    """Labels for one comparison part: one per variable or per region."""
+    if kind == "variable_comparison":
+        return [str(variable) for variable in payload.get("variables") or []]
+    if kind == "region_comparison":
+        return [f"region_{index}" for index in range(1, len(payload.get("regions") or []) + 1)]
+    return []
+
+
 def create_job(kind: str, payload: dict[str, Any]) -> str:
     """Create a job, enqueue it, and return its id.
 
     ``ANALYSIS_QUEUE_MODE=inline`` runs the job in-process, which is useful for
     tests and local debugging without Redis. The Docker stack uses ``redis``.
+
+    Comparisons with more than one part are split into one RQ job per part so
+    idle worker replicas can work on them in parallel; the last part to finish
+    assembles the result. Single-part comparisons keep the normal path.
     """
     job_id = uuid.uuid4().hex
     write_status(
@@ -76,6 +90,11 @@ def create_job(kind: str, payload: dict[str, Any]) -> str:
             log(f"jobs: {job_id}: inline run failed: {type(exc).__name__}: {exc}")
         return job_id
 
+    if kind in COMPARISON_KINDS:
+        labels = comparison_part_labels(kind, payload)
+        if len(labels) > 1:
+            return _enqueue_comparison(job_id, kind, payload, labels)
+
     from rq import Queue
 
     try:
@@ -96,6 +115,72 @@ def create_job(kind: str, payload: dict[str, Any]) -> str:
         write_status(job_id, status)
         raise
     log(f"jobs: {job_id}: queued ({kind})")
+    return job_id
+
+
+def _enqueue_comparison(
+    job_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    labels: list[str],
+) -> str:
+    """Split a comparison into per-part RQ jobs plus a timeout watchdog."""
+    from rq import Queue
+
+    parts = [
+        {"index": index, "label": label, "rq_job_id": f"{job_id}-p{index}"}
+        for index, label in enumerate(labels)
+    ]
+    status = read_status(job_id) or {"job_id": job_id, "kind": kind}
+    status.update({"parts": parts, "parts_total": len(parts)})
+    write_status(job_id, status)
+
+    queue = None
+    timeout = _job_timeout()
+    enqueued: list[dict[str, Any]] = []
+    try:
+        queue = Queue(QUEUE_NAME, connection=_redis_connection())
+        for part in parts:
+            queue.enqueue(
+                "app.jobs.tasks.run_comparison_part",
+                job_id,
+                kind,
+                payload,
+                part["index"],
+                job_id=part["rq_job_id"],
+                job_timeout=timeout,
+                result_ttl=86400,
+                failure_ttl=86400,
+            )
+            enqueued.append(part)
+        # If a part is killed hard (RQ timeout), it never bumps the completion
+        # counter. This delayed job settles the parent instead of leaving it
+        # "started" forever.
+        queue.enqueue_in(
+            timedelta(seconds=timeout + 120),
+            "app.jobs.tasks.finalize_comparison_watchdog",
+            job_id,
+            kind,
+            payload,
+            job_id=f"{job_id}-watchdog",
+            job_timeout=900,
+            result_ttl=86400,
+            failure_ttl=86400,
+        )
+    except Exception:
+        for part in enqueued:
+            _cancel_queued_rq_job(part["rq_job_id"])
+        status.update(
+            {
+                "status": "failed",
+                "error": "Could not enqueue comparison parts: Redis is unavailable.",
+                "updated_at": utc_now(),
+            }
+        )
+        write_status(job_id, status)
+        raise
+
+    log(f"jobs: {job_id}: queued {kind} as {len(parts)} part(s): {', '.join(labels)}")
     return job_id
 
 
@@ -193,6 +278,9 @@ def cancel_job(job_id: str, *, force: bool = False) -> dict[str, Any] | None:
         }
     )
 
+    if status.get("parts"):
+        return _cancel_comparison_parts(status, force=force, requested_at=requested_at)
+
     if current == "queued":
         if _cancel_queued_rq_job(job_id):
             status.update({"status": "canceled", "stage": "canceled", "canceled_at": requested_at})
@@ -211,6 +299,55 @@ def cancel_job(job_id: str, *, force: bool = False) -> dict[str, Any] | None:
     else:
         status.update({"status": "canceling", "stage": "canceling"})
         log(f"jobs: {job_id}: cancel requested while running")
+    write_status(job_id, status)
+    return status
+
+
+def _cancel_comparison_parts(
+    status: dict[str, Any], *, force: bool, requested_at: str
+) -> dict[str, Any]:
+    """Cancel every RQ job that makes up a distributed comparison."""
+    job_id = str(status.get("job_id"))
+    removed: list[int] = []
+    active = False
+
+    for part in status.get("parts") or []:
+        index = int(part.get("index", 0))
+        rq_id = part.get("rq_job_id")
+        if not rq_id:
+            continue
+        if force:
+            _stop_running_rq_job(rq_id)
+            removed.append(index)
+            continue
+        if _cancel_queued_rq_job(rq_id):
+            removed.append(index)
+            continue
+        rq_job = _get_rq_job(rq_id)
+        if rq_job is not None and rq_job.get_status(refresh=True) not in {
+            "canceled",
+            "stopped",
+            "failed",
+            "finished",
+        }:
+            active = True
+
+    if removed:
+        try:
+            from app.jobs.tasks import mark_parts_canceled
+
+            mark_parts_canceled(job_id, sorted(set(removed)))
+        except Exception as exc:
+            log(f"jobs: {job_id}: could not mark canceled parts: {type(exc).__name__}: {exc}")
+
+    if force or not active:
+        status.update(
+            {"status": "canceled", "stage": "canceled", "canceled_at": requested_at, "updated_at": requested_at}
+        )
+        log(f"jobs: {job_id}: comparison canceled ({len(removed)} part(s) stopped)")
+    else:
+        status.update({"status": "canceling", "stage": "canceling", "updated_at": requested_at})
+        log(f"jobs: {job_id}: cancel requested for comparison parts")
     write_status(job_id, status)
     return status
 
