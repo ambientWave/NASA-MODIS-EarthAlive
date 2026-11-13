@@ -8,7 +8,13 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.routes.analysis import AOIRequest, MAX_TOTAL_DAYS, PRODUCT_START_DATE, SamplingRequest
+from app.api.routes.analysis import (
+    AOIRequest,
+    MAX_TOTAL_DAYS,
+    PRODUCT_START_DATE,
+    SamplingRequest,
+    validate_sampling_and_strategy,
+)
 from app.jobs import create_job
 from app.services.analysis_engine import SUPPORTED_METHODS
 from app.services.temporal import resolve_seed
@@ -31,8 +37,14 @@ class VariableComparisonRequest(BaseModel):
     aoi: AOIRequest = Field(..., description="Geographic bounding box shared by every variable.")
     start_date: str = Field(..., description="Start date in ISO format YYYY-MM-DD.")
     end_date: str = Field(..., description="End date in ISO format YYYY-MM-DD.")
-    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field("daily")
-    spatial_strategy: Literal["coarse", "native"] = Field("coarse")
+    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field(
+        "daily",
+        description="Aggregation frequency: `daily`, `monthly`, or `yearly`.",
+    )
+    spatial_strategy: Literal["coarse", "native"] = Field(
+        "coarse",
+        description="Spatial resolution strategy (`coarse` or `native`). Only applicable for `monthly` or `yearly`.",
+    )
     sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     variables: list[str] = Field(
         ...,
@@ -50,8 +62,14 @@ class RegionComparisonRequest(BaseModel):
     regions: list[AOIRequest] = Field(..., description="List of bounding boxes.")
     start_date: str = Field(..., description="Start date in ISO format YYYY-MM-DD.")
     end_date: str = Field(..., description="End date in ISO format YYYY-MM-DD.")
-    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field("daily")
-    spatial_strategy: Literal["coarse", "native"] = Field("coarse")
+    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field(
+        "daily",
+        description="Aggregation frequency: `daily`, `monthly`, or `yearly`.",
+    )
+    spatial_strategy: Literal["coarse", "native"] = Field(
+        "coarse",
+        description="Spatial resolution strategy (`coarse` or `native`). Only applicable for `monthly` or `yearly`.",
+    )
     sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     analysis_methods: list[AnalysisMethod] = Field(
         default_factory=lambda: ["linear_regression", "mann_kendall", "t_test"]
@@ -61,16 +79,12 @@ class RegionComparisonRequest(BaseModel):
 
 def _collection_options(payload: Any, seed_key: str) -> dict[str, Any]:
     """Validate and normalise resolution/strategy/sampling for a comparison."""
-    resolution = str(payload.temporal_resolution).lower()
-    strategy = str(payload.spatial_strategy).lower()
-    if resolution == "daily":
-        if payload.sampling.mode != "full_period":
-            raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
-        if strategy != "coarse":
-            raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
-    sampling = payload.sampling.model_dump()
-    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
-        sampling["seed"] = resolve_seed(None, fallback_key=seed_key)
+    resolution, strategy, sampling = validate_sampling_and_strategy(
+        payload.temporal_resolution,
+        payload.spatial_strategy,
+        payload.sampling,
+        seed_key=seed_key,
+    )
     return {
         "temporal_resolution": resolution,
         "spatial_strategy": strategy,

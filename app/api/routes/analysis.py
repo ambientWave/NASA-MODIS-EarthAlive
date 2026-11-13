@@ -34,21 +34,37 @@ class AOIRequest(BaseModel):
 
 
 class SamplingRequest(BaseModel):
-    """Random observation sampling, used instead of averaging where needed."""
+    """Observation sampling settings for monthly or yearly aggregations.
+
+    Frontend Rules:
+    - Only relevant when `temporal_resolution` is `monthly` or `yearly`.
+    - When `mode` is `full_period`: `samples_per_month`, `seed`, and `missing` are ignored.
+    - When `mode` is `random_sample`: `samples_per_month` (1..15) defines how many days are sampled.
+    """
 
     mode: Literal["full_period", "random_sample"] = Field(
         "full_period",
         description=(
-            "`full_period` uses every available observation or the provider monthly product. "
-            "`random_sample` selects uniformly random real observed days per calendar month, "
-            "which is the fallback for variables without a monthly product."
+            "Observation selection mode:\n"
+            "- `full_period` (Default): Uses every observation in the month or the NASA monthly product. "
+            "`samples_per_month` is ignored.\n"
+            "- `random_sample`: Selects N uniform random real observations per calendar month. "
+            "Requires `samples_per_month` (1-15)."
         ),
     )
-    samples_per_month: int = Field(1, ge=1, le=15, description="Random days selected per calendar month.")
-    seed: int | None = Field(None, description="Seed for reproducible sampling; derived from the request when omitted.")
+    samples_per_month: int = Field(
+        1,
+        ge=1,
+        le=15,
+        description="Number of random days selected per calendar month (1 to 15). Only active when mode is 'random_sample'.",
+    )
+    seed: int | None = Field(
+        None,
+        description="Optional seed for reproducible random sampling. Derived from request parameters if omitted.",
+    )
     missing: Literal["keep", "redraw"] = Field(
         "keep",
-        description="`keep` leaves a missing sampled day missing; `redraw` replaces it with another candidate day.",
+        description="Policy for missing sampled days: `keep` retains the gap, `redraw` draws an alternate day in the month.",
     )
 
 
@@ -78,8 +94,11 @@ class TrendAnalysisRequest(BaseModel):
     spatial_strategy: Literal["coarse", "native"] = Field(
         "coarse",
         description=(
-            "`coarse` reads the provider's monthly product (12 files/year, 0.05° for "
-            "MODIS). `native` aggregates the daily/native product (more files, finer pixels)."
+            "Spatial resolution strategy for monthly/yearly aggregation:\n"
+            "- `coarse` (Default, Fast): Reads the provider's pre-packaged monthly product "
+            "(12 files/year, ~0.05° resolution).\n"
+            "- `native` (Detailed, Heavy): Aggregates all daily native resolution files.\n"
+            "UI Rule: Only applicable when `temporal_resolution` is `monthly` or `yearly`."
         ),
     )
     sampling: SamplingRequest = Field(default_factory=SamplingRequest)
@@ -139,6 +158,57 @@ def _resolve_variable(payload: TrendAnalysisRequest) -> str:
     return from_variable or from_product or "land_surface_temperature"
 
 
+def validate_sampling_and_strategy(
+    temporal_resolution: str,
+    spatial_strategy: str,
+    sampling: SamplingRequest,
+    seed_key: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Validate and normalize temporal resolution, spatial strategy, and sampling.
+
+    Core Rules for Frontend Integration:
+    -----------------------------------
+    1. Daily Resolution (`temporal_resolution="daily"`):
+       - Uses full daily native observations.
+       - `spatial_strategy` must be 'coarse' (the default) or omitted.
+       - `sampling.mode` must be 'full_period' (the default) or omitted.
+       - `samples_per_month` is not applicable.
+
+    2. Monthly / Yearly Resolution (`temporal_resolution="monthly" | "yearly"`):
+       - Mode `full_period` + Strategy `coarse`:
+         Uses NASA pre-packaged monthly composite (fastest). `samples_per_month` is ignored.
+       - Mode `full_period` + Strategy `native`:
+         Aggregates all daily native tiles in each month (detailed). `samples_per_month` is ignored.
+       - Mode `random_sample`:
+         Samples `samples_per_month` (1..15) uniformly random real days per month at native resolution.
+    """
+    resolution = str(temporal_resolution).lower()
+    if resolution not in SUPPORTED_TEMPORAL_RESOLUTION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported temporal resolution: '{temporal_resolution}'. Supported values: {sorted(SUPPORTED_TEMPORAL_RESOLUTION)}",
+        )
+
+    strategy = str(spatial_strategy).lower()
+    if resolution == "daily":
+        if sampling.mode != "full_period":
+            raise HTTPException(
+                status_code=400,
+                detail="Random sampling requires a monthly or yearly temporal_resolution.",
+            )
+        if strategy != "coarse":
+            raise HTTPException(
+                status_code=400,
+                detail="spatial_strategy only applies to monthly or yearly requests.",
+            )
+
+    sampling_dict = sampling.model_dump()
+    if sampling_dict["mode"] == "random_sample" and sampling_dict["seed"] is None:
+        sampling_dict["seed"] = resolve_seed(None, fallback_key=seed_key)
+
+    return resolution, strategy, sampling_dict
+
+
 @router.post(
     "/trend",
     status_code=202,
@@ -183,29 +253,16 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
     if aoi["south"] >= aoi["north"]:
         raise HTTPException(status_code=400, detail="AOI south must be less than north.")
 
-    temporal_resolution = str(payload.temporal_resolution).lower()
-    if temporal_resolution not in SUPPORTED_TEMPORAL_RESOLUTION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported temporal resolution: '{payload.temporal_resolution}'. Supported values: {sorted(SUPPORTED_TEMPORAL_RESOLUTION)}",
-        )
-
-    spatial_strategy = str(payload.spatial_strategy).lower()
-    if temporal_resolution == "daily":
-        if payload.sampling.mode != "full_period":
-            raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
-        if spatial_strategy != "coarse":
-            raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
-
-    sampling = payload.sampling.model_dump()
-    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
-        sampling["seed"] = resolve_seed(
-            None,
-            fallback_key=(
-                f"{variable_id}|{start_date.isoformat()}|{end_date.isoformat()}|"
-                f"{aoi['west']},{aoi['south']},{aoi['east']},{aoi['north']}"
-            ),
-        )
+    seed_key = (
+        f"{variable_id}|{start_date.isoformat()}|{end_date.isoformat()}|"
+        f"{aoi['west']},{aoi['south']},{aoi['east']},{aoi['north']}"
+    )
+    temporal_resolution, spatial_strategy, sampling = validate_sampling_and_strategy(
+        payload.temporal_resolution,
+        payload.spatial_strategy,
+        payload.sampling,
+        seed_key=seed_key,
+    )
 
     requested_methods = [str(method).lower() for method in payload.analysis_methods]
     unsupported_methods = sorted(set(requested_methods) - SUPPORTED_ANALYSIS_METHODS)
