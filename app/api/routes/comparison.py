@@ -64,12 +64,12 @@ def _collection_options(payload: Any, seed_key: str) -> dict[str, Any]:
     resolution = str(payload.temporal_resolution).lower()
     strategy = str(payload.spatial_strategy).lower()
     if resolution == "daily":
-        if payload.sampling.mode != "all":
+        if payload.sampling.mode != "full_period":
             raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
         if strategy != "coarse":
             raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
     sampling = payload.sampling.model_dump()
-    if sampling["mode"] == "random_day_per_month" and sampling["seed"] is None:
+    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
         sampling["seed"] = resolve_seed(None, fallback_key=seed_key)
     return {
         "temporal_resolution": resolution,

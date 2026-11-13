@@ -94,20 +94,20 @@ def collect_resolved_variable(variable_id: str, request: CollectionRequest) -> V
     if resolution not in {"daily", "monthly", "yearly"}:
         raise ValueError(f"Unsupported temporal resolution: '{request.temporal_resolution}'")
     strategy = str(request.spatial_strategy or "coarse").lower()
-    sampling = str(request.sampling_mode or "all").lower()
+    sampling = str(request.sampling_mode or "full_period").lower()
 
     if (
-        sampling == "all"
+        sampling == "full_period"
         and resolution != "daily"
         and strategy == "coarse"
         and spec.monthly_source is None
     ):
         # No provider monthly product (e.g. soil moisture): fall back to random
         # real observations instead of silently downloading every daily file.
-        sampling = "random_day_per_month"
+        sampling = "random_sample"
         log(f"sampling: {variable_id}: no monthly source, using random monthly sampling")
 
-    if sampling == "random_day_per_month":
+    if sampling == "random_sample":
         seed = resolve_seed(
             request.sampling_seed,
             fallback_key=f"{variable_id}|{request.start_date}|{request.end_date}|{request.aoi}",
@@ -149,12 +149,12 @@ def collect_resolved_variable(variable_id: str, request: CollectionRequest) -> V
 
     if resolution == "daily":
         series = _daily_collect(variable_id, request)
-        series.sampling = {"mode": "all", "samples_per_month": request.samples_per_month}
+        series.sampling = {"mode": "full_period", "samples_per_month": request.samples_per_month}
         return series
 
     if strategy == "coarse" and spec.monthly_source is not None:
         series = collect_period_variable(request, spec, spec.monthly_source)
-        series.sampling = {"mode": "all", "samples_per_month": request.samples_per_month}
+        series.sampling = {"mode": "full_period", "samples_per_month": request.samples_per_month}
         if resolution == "yearly":
             series.records = aggregate_records(series.records, spec, "yearly")
             series.frequency = "yearly"
@@ -169,5 +169,5 @@ def collect_resolved_variable(variable_id: str, request: CollectionRequest) -> V
     series.records = aggregate_records(series.records, spec, resolution)
     series.frequency = resolution
     series.collection_strategy = "native_aggregated"
-    series.sampling = {"mode": "all", "samples_per_month": request.samples_per_month}
+    series.sampling = {"mode": "full_period", "samples_per_month": request.samples_per_month}
     return series

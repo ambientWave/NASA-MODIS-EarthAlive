@@ -36,11 +36,11 @@ class AOIRequest(BaseModel):
 class SamplingRequest(BaseModel):
     """Random observation sampling, used instead of averaging where needed."""
 
-    mode: Literal["all", "random_day_per_month"] = Field(
-        "all",
+    mode: Literal["full_period", "random_sample"] = Field(
+        "full_period",
         description=(
-            "`all` uses every day or the provider monthly product. "
-            "`random_day_per_month` selects uniformly random real observations, "
+            "`full_period` uses every available observation or the provider monthly product. "
+            "`random_sample` selects uniformly random real observed days per calendar month, "
             "which is the fallback for variables without a monthly product."
         ),
     )
@@ -192,13 +192,13 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
 
     spatial_strategy = str(payload.spatial_strategy).lower()
     if temporal_resolution == "daily":
-        if payload.sampling.mode != "all":
+        if payload.sampling.mode != "full_period":
             raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
         if spatial_strategy != "coarse":
             raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
 
     sampling = payload.sampling.model_dump()
-    if sampling["mode"] == "random_day_per_month" and sampling["seed"] is None:
+    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
         sampling["seed"] = resolve_seed(
             None,
             fallback_key=(

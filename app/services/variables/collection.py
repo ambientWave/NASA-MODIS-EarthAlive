@@ -41,7 +41,7 @@ def collect_chunked_variable(
     should_cancel: Callable[[], bool] | None = None,
     temporal_resolution: str = "daily",
     spatial_strategy: str = "coarse",
-    sampling_mode: str = "all",
+    sampling_mode: str = "full_period",
     samples_per_month: int = 1,
     sampling_seed: int | None = None,
     sampling_missing: str = "keep",

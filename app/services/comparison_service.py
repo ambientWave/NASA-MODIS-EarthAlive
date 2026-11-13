@@ -36,7 +36,7 @@ def _collection_options(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "temporal_resolution": str(payload.get("temporal_resolution") or "daily").lower(),
         "spatial_strategy": str(payload.get("spatial_strategy") or "coarse").lower(),
-        "sampling_mode": str(sampling.get("mode") or "all").lower(),
+        "sampling_mode": str(sampling.get("mode") or "full_period").lower(),
         "samples_per_month": int(sampling.get("samples_per_month") or 1),
         "sampling_seed": sampling.get("seed"),
         "sampling_missing": str(sampling.get("missing") or "keep").lower(),
@@ -149,7 +149,7 @@ def variable_part(
             "collection_strategy": series.collection_strategy,
             "source_products": series.source_products or [spec.dataset],
             "source_resolution": series.source_resolution or spec.native_resolution,
-            "sampling": series.sampling or {"mode": "all"},
+            "sampling": series.sampling or {"mode": "full_period"},
         }
     except JobCanceled:
         raise
@@ -176,7 +176,7 @@ def variable_part(
             "collection_strategy": "failed",
             "source_products": [],
             "source_resolution": None,
-            "sampling": {"mode": "all"},
+            "sampling": {"mode": "full_period"},
         }
 
 
@@ -247,7 +247,7 @@ def region_part(
             "collection_strategy": series.collection_strategy,
             "source_products": series.source_products or [spec.dataset],
             "source_resolution": series.source_resolution or spec.native_resolution,
-            "sampling": series.sampling or {"mode": "all"},
+            "sampling": series.sampling or {"mode": "full_period"},
         }
     except JobCanceled:
         raise
@@ -275,7 +275,7 @@ def region_part(
             "collection_strategy": "failed",
             "source_products": [],
             "source_resolution": None,
-            "sampling": {"mode": "all"},
+            "sampling": {"mode": "full_period"},
         }
 
 
@@ -302,7 +302,7 @@ def failed_part(key: str, label: str, exc: BaseException, unit: str = "") -> dic
         "collection_strategy": "failed",
         "source_products": [],
         "source_resolution": None,
-        "sampling": {"mode": "all"},
+        "sampling": {"mode": "full_period"},
     }
 
 
@@ -348,7 +348,7 @@ def _collection_metadata(payload: dict[str, Any], parts: list[dict[str, Any]]) -
         "collection_strategy": first.get("collection_strategy"),
         "source_products": first.get("source_products", []),
         "native_resolution": first.get("source_resolution"),
-        "sampling": first.get("sampling", {"mode": "all"}),
+        "sampling": first.get("sampling", {"mode": "full_period"}),
     }
 
 

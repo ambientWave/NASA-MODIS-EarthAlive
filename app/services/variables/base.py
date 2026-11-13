@@ -68,7 +68,7 @@ class CollectionRequest:
     output_dir: Path
     temporal_resolution: str = "daily"
     spatial_strategy: str = "coarse"
-    sampling_mode: str = "all"
+    sampling_mode: str = "full_period"
     samples_per_month: int = 1
     sampling_seed: int | None = None
     sampling_missing: str = "keep"

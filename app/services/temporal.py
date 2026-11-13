@@ -23,7 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.services.variables.base import VariableSpec
 
 RESOLUTIONS = ("daily", "monthly", "yearly")
-SAMPLING_MODES = ("all", "random_day_per_month")
+SAMPLING_MODES = ("full_period", "random_sample")
 
 
 def days_in_month(year: int, month: int) -> int:

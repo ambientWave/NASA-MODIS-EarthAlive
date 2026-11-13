@@ -238,7 +238,7 @@ def test_api_rejects_sampling_for_daily_requests():
     client = TestClient(app)
     response = client.post(
         "/api/v1/analysis/trend",
-        json=_payload(temporal_resolution="daily", sampling={"mode": "random_day_per_month"}),
+        json=_payload(temporal_resolution="daily", sampling={"mode": "random_sample"}),
     )
     assert response.status_code == 400
     assert "monthly or yearly" in response.json()["detail"]
@@ -267,7 +267,7 @@ def test_api_derives_a_reproducible_sampling_seed(monkeypatch, tmp_path):
             records=_daily_records("2024-01-01", "2024-12-31"),
             frequency="monthly",
             collection_strategy="sampled",
-            sampling={"mode": "random_day_per_month", "seed": kwargs.get("sampling_seed")},
+            sampling={"mode": "random_sample", "seed": kwargs.get("sampling_seed")},
         )
 
     monkeypatch.setattr("app.jobs.queue.QUEUE_MODE", "inline")
@@ -281,7 +281,7 @@ def test_api_derives_a_reproducible_sampling_seed(monkeypatch, tmp_path):
         json=_payload(
             variable="soil_moisture",
             temporal_resolution="monthly",
-            sampling={"mode": "random_day_per_month"},
+            sampling={"mode": "random_sample"},
         ),
     )
     assert response.status_code == 202, response.text
@@ -289,7 +289,7 @@ def test_api_derives_a_reproducible_sampling_seed(monkeypatch, tmp_path):
     assert isinstance(captured.get("sampling_seed"), int)
 
     body = client.get(response.json()["result_url"]).json()
-    assert body["metadata"]["sampling"]["mode"] == "random_day_per_month"
+    assert body["metadata"]["sampling"]["mode"] == "random_sample"
     assert body["metadata"]["sampling"]["seed"] == captured["sampling_seed"]
 
     # The same request must produce the same seed.

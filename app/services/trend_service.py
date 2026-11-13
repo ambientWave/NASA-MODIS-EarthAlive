@@ -100,7 +100,7 @@ def execute_trend_analysis(
     temporal_resolution = str(payload["temporal_resolution"]).lower()
     spatial_strategy = str(payload.get("spatial_strategy") or "coarse").lower()
     sampling = dict(payload.get("sampling") or {})
-    sampling_mode = str(sampling.get("mode") or "all").lower()
+    sampling_mode = str(sampling.get("mode") or "full_period").lower()
     samples_per_month = int(sampling.get("samples_per_month") or 1)
     sampling_seed = sampling.get("seed")
     sampling_missing = str(sampling.get("missing") or "keep").lower()
@@ -212,7 +212,7 @@ def execute_trend_analysis(
             "spatial_strategy": spatial_strategy if temporal_resolution != "daily" else None,
             "collection_strategy": series.collection_strategy,
             "source_products": series.source_products or [spec.dataset],
-            "sampling": series.sampling or {"mode": "all"},
+            "sampling": series.sampling or {"mode": "full_period"},
             "start_date": start_date,
             "end_date": end_date,
             "aoi": aoi,
