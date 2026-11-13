@@ -40,7 +40,7 @@ from app.services.modis_processor import (
     read_raster,
     warp_subdataset_to_aoi,
 )
-from app.services.variables.base import CollectionRequest, VariableSeries, VariableSpec, build_record
+from app.services.variables.base import CollectionRequest, PeriodSource, VariableSeries, VariableSpec, build_record
 from app.services.variables.remote_grid import date_chunks, granule_date
 from app.utils import cache
 from app.utils.logging import log
@@ -72,6 +72,20 @@ SPEC = VariableSpec(
     unit="NDVI",
     native_resolution="16-day",
     value_label="NDVI",
+    monthly_source=PeriodSource(
+        short_name="MOD13C2",
+        version="061",
+        variable_names=("CMG 0.05 Deg Monthly NDVI",),
+        reader="gdal",
+        native_resolution="0.05°",
+        scale=0.0001,
+        valid_min=-2000.0,
+        valid_max=10000.0,
+        gdal_grid="MODIS_Grid_Monthly_CMG_VI",
+        gdal_subdataset="CMG 0.05 Deg Monthly NDVI",
+        gdal_src_nodata=-3000.0,
+        analysis_resolution=0.005,
+    ),
 )
 
 DAILY_FILL_DAYS = 16
@@ -299,11 +313,62 @@ def _composite_mean(
     return float(np.mean(finite)), int(finite.size), total, granules, merged
 
 
+def _record_for_day(
+    day: str,
+    composite_records: dict[str, dict[str, Any]],
+    *,
+    sampled: bool = False,
+) -> dict[str, Any]:
+    """Build one canonical record from the composite that covers ``day``."""
+    current = date.fromisoformat(day)
+    source = None
+    for composite_date in reversed(sorted(composite_records)):
+        if composite_date <= day:
+            source = composite_date
+            break
+    if source is None:
+        return build_record(
+            day,
+            None,
+            SPEC,
+            missing_reason="No MODIS composite is available on or before this date.",
+            source_frequency="16-day",
+        )
+    source_day = date.fromisoformat(source)
+    if (current - source_day).days >= DAILY_FILL_DAYS:
+        return build_record(
+            day,
+            None,
+            SPEC,
+            missing_reason=f"The most recent MODIS composite ({source}) is outside its 16-day window.",
+            source_frequency="16-day",
+        )
+    composite = composite_records[source]
+    return build_record(
+        day,
+        composite["value"],
+        SPEC,
+        valid_pixels=composite["valid_pixels"],
+        total_pixels=composite["total_pixels"],
+        missing_reason=(
+            None if composite["value"] is not None else "No valid NDVI pixels after pixel-reliability filtering."
+        ),
+        granules_used=composite["granules"],
+        coverage_status=(
+            "missing"
+            if composite["value"] is None
+            else ("sampled" if sampled else "period_value")
+        ),
+        source_frequency="16-day",
+    )
+
+
 def collect(request: CollectionRequest) -> VariableSeries:
     bounds = (request.aoi["west"], request.aoi["south"], request.aoi["east"], request.aoi["north"])
     resolution = float(CONFIG["resolution_deg"])
     width, height = destination_grid_size(bounds, resolution)
     aoi_hash = _aoi_key(bounds, resolution)
+    sample_days = sorted(request.sample_days) if request.sample_days else None
 
     cache_root = _cache_root()
     raw_dir = cache_root / "raw"
@@ -321,12 +386,24 @@ def collect(request: CollectionRequest) -> VariableSeries:
 
     for chunk_start, chunk_end in date_chunks(request.start_date, request.end_date, 366):
         request.check_cancel()
-        log(f"variables: ndvi: searching {PRODUCT} {chunk_start} -> {chunk_end}")
+        search_start = chunk_start
+        search_end = chunk_end
+        if sample_days:
+            # A sampled day is served by the composite that covers it, which can
+            # start up to 15 days before the day and up to 15 days before the
+            # chunk boundary.
+            search_start = (
+                date.fromisoformat(chunk_start) - timedelta(days=DAILY_FILL_DAYS - 1)
+            ).isoformat()
+            search_end = (
+                date.fromisoformat(chunk_end) + timedelta(days=DAILY_FILL_DAYS - 1)
+            ).isoformat()
+        log(f"variables: ndvi: searching {PRODUCT} {search_start} -> {search_end}")
         granules = earthaccess.search_data(
             short_name=PRODUCT,
             version="061",
             count=-1,
-            temporal=(chunk_start, chunk_end),
+            temporal=(search_start, search_end),
             bounding_box=bounds,
         )
         grouped: dict[str, list[Any]] = {}
@@ -336,6 +413,22 @@ def collect(request: CollectionRequest) -> VariableSeries:
                 grouped.setdefault(composite_date, []).append(granule)
 
         dates = sorted(grouped)
+        if sample_days:
+            # Download only the composites that cover a sampled day.
+            wanted: set[str] = set()
+            chunk_sample_days = [day for day in sample_days if chunk_start <= day <= chunk_end]
+            for day in chunk_sample_days:
+                latest = None
+                for composite_date in dates:
+                    if composite_date <= day:
+                        latest = composite_date
+                    else:
+                        break
+                if latest is not None and (
+                    date.fromisoformat(day) - date.fromisoformat(latest)
+                ).days < DAILY_FILL_DAYS:
+                    wanted.add(latest)
+            dates = [composite_date for composite_date in dates if composite_date in wanted]
         if not dates:
             warnings.append(f"No {PRODUCT} composites were found for {chunk_start} -> {chunk_end}.")
             continue
@@ -410,59 +503,18 @@ def collect(request: CollectionRequest) -> VariableSeries:
 
     # Carry each 16-day composite forward across its own window to produce a
     # daily response series. Days without a composite remain explicit misses.
-    composite_dates = sorted(composite_records)
-    records: list[dict[str, Any]] = []
-    current = date.fromisoformat(request.start_date)
-    end = date.fromisoformat(request.end_date)
-    while current <= end:
-        day = current.isoformat()
-        source = None
-        for composite_date in reversed(composite_dates):
-            if composite_date <= day:
-                source = composite_date
-                break
-        if source is None:
-            records.append(
-                build_record(
-                    day,
-                    None,
-                    SPEC,
-                    missing_reason="No MODIS composite is available on or before this date.",
-                    source_frequency="16-day",
-                )
-            )
-        else:
-            source_day = date.fromisoformat(source)
-            if (current - source_day).days >= DAILY_FILL_DAYS:
-                records.append(
-                    build_record(
-                        day,
-                        None,
-                        SPEC,
-                        missing_reason=f"The most recent MODIS composite ({source}) is outside its 16-day window.",
-                        source_frequency="16-day",
-                    )
-                )
-            else:
-                composite = composite_records[source]
-                records.append(
-                    build_record(
-                        day,
-                        composite["value"],
-                        SPEC,
-                        valid_pixels=composite["valid_pixels"],
-                        total_pixels=composite["total_pixels"],
-                        missing_reason=(
-                            None
-                            if composite["value"] is not None
-                            else "No valid NDVI pixels after pixel-reliability filtering."
-                        ),
-                        granules_used=composite["granules"],
-                        coverage_status="period_value",
-                        source_frequency="16-day",
-                    )
-                )
-        current += timedelta(days=1)
+    # For random sampling only the selected days become records.
+    if sample_days:
+        records: list[dict[str, Any]] = [
+            _record_for_day(day, composite_records, sampled=True) for day in sample_days
+        ]
+    else:
+        records = []
+        current = date.fromisoformat(request.start_date)
+        end = date.fromisoformat(request.end_date)
+        while current <= end:
+            records.append(_record_for_day(current.isoformat(), composite_records))
+            current += timedelta(days=1)
 
     mean_raster = None
     if raster_sum is not None and raster_count is not None:

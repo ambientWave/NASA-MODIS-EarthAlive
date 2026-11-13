@@ -91,7 +91,13 @@ def test_date_chunks_are_inclusive_and_bounded():
 
 def test_execute_variable_comparison_merges_and_analyses(monkeypatch, tmp_path):
     monkeypatch.setattr(comparison_service, "JOBS_DIR", tmp_path)
-    monkeypatch.setattr(comparison_service, "collect_variable", lambda variable_id, request: _fake_series(variable_id, request.start_date, request.end_date))
+    monkeypatch.setattr(
+        comparison_service,
+        "collect_chunked_variable",
+        lambda variable_id, aoi, start_date, end_date, output_dir, **kwargs: _fake_series(
+            variable_id, start_date, end_date
+        ),
+    )
     monkeypatch.setattr(comparison_service, "MAX_DAYS_PER_DAILY_JOB", 10)
 
     result = comparison_service.execute_variable_comparison(
@@ -117,7 +123,13 @@ def test_execute_variable_comparison_merges_and_analyses(monkeypatch, tmp_path):
 
 def test_execute_region_comparison_uses_region_keys(monkeypatch, tmp_path):
     monkeypatch.setattr(comparison_service, "JOBS_DIR", tmp_path)
-    monkeypatch.setattr(comparison_service, "collect_variable", lambda variable_id, request: _fake_series(variable_id, request.start_date, request.end_date))
+    monkeypatch.setattr(
+        comparison_service,
+        "collect_chunked_variable",
+        lambda variable_id, aoi, start_date, end_date, output_dir, **kwargs: _fake_series(
+            variable_id, start_date, end_date
+        ),
+    )
 
     result = comparison_service.execute_region_comparison(
         {

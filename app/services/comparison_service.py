@@ -20,7 +20,7 @@ from typing import Any, Callable
 from app.jobs.errors import JobCanceled
 from app.services.analysis_engine import run_series_analysis
 from app.services.comparison_charts import generate_comparison_visualizations
-from app.services.variables import collect_variable, get_variable_spec
+from app.services.variables import collect_resolved_variable, get_variable_spec
 from app.services.variables.collection import collect_chunked_variable
 from app.utils.logging import log
 
@@ -29,6 +29,18 @@ JOBS_DIR = PROJECT_ROOT / "data" / "jobs"
 MAX_DAYS_PER_DAILY_JOB = int(os.environ.get("MAX_DAYS_PER_DAILY_JOB", "1826"))
 
 ProgressCallback = Callable[[str, str, int, int], None]
+
+
+def _collection_options(payload: dict[str, Any]) -> dict[str, Any]:
+    sampling = dict(payload.get("sampling") or {})
+    return {
+        "temporal_resolution": str(payload.get("temporal_resolution") or "daily").lower(),
+        "spatial_strategy": str(payload.get("spatial_strategy") or "coarse").lower(),
+        "sampling_mode": str(sampling.get("mode") or "all").lower(),
+        "samples_per_month": int(sampling.get("samples_per_month") or 1),
+        "sampling_seed": sampling.get("seed"),
+        "sampling_missing": str(sampling.get("missing") or "keep").lower(),
+    }
 
 
 def _collect_chunked(
@@ -40,8 +52,9 @@ def _collect_chunked(
     progress: ProgressCallback | None = None,
     progress_label: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
-) -> tuple[list[dict[str, Any]], list[str], Any, Any]:
-    series = collect_chunked_variable(
+    options: dict[str, Any] | None = None,
+):
+    return collect_chunked_variable(
         variable_id,
         aoi,
         start_date,
@@ -51,9 +64,9 @@ def _collect_chunked(
         progress=progress,
         progress_label=progress_label,
         should_cancel=should_cancel,
-        collector=collect_variable,
+        collector=collect_resolved_variable,
+        **(options or {}),
     )
-    return series.records, series.warnings, series.mean_raster, series.raster_bounds
 
 
 def _variable_metadata(spec: Any) -> dict[str, Any]:
@@ -88,7 +101,7 @@ def variable_part(
         progress("variable", variable_id, position[0] - 1, position[1])
 
     try:
-        records, warnings, mean_raster, raster_bounds = _collect_chunked(
+        series = _collect_chunked(
             variable_id,
             payload["aoi"],
             payload["start_date"],
@@ -97,7 +110,10 @@ def variable_part(
             progress=progress,
             progress_label=variable_id,
             should_cancel=should_cancel,
+            options=_collection_options(payload),
         )
+        records = series.records
+        warnings = series.warnings
         analysis = run_series_analysis(
             records,
             payload["analysis_methods"],
@@ -105,12 +121,15 @@ def variable_part(
             product=spec.dataset,
             unit=spec.unit,
             label=spec.value_label,
-            mean_raster=mean_raster,
-            raster_bounds=raster_bounds,
+            mean_raster=series.mean_raster,
+            raster_bounds=series.raster_bounds,
             include_visualizations=include_visualizations,
         )
         entry = {
-            "metadata": _variable_metadata(spec),
+            "metadata": {
+                **_variable_metadata(spec),
+                "native_resolution": series.source_resolution or spec.native_resolution,
+            },
             "series": records,
             "data_quality": analysis.get("data_quality", {}),
             "analysis_results": analysis.get("analysis_results", {}),
@@ -127,6 +146,10 @@ def variable_part(
             "series": records,
             "analysis": analysis,
             "warnings": entry["warnings"],
+            "collection_strategy": series.collection_strategy,
+            "source_products": series.source_products or [spec.dataset],
+            "source_resolution": series.source_resolution or spec.native_resolution,
+            "sampling": series.sampling or {"mode": "all"},
         }
     except JobCanceled:
         raise
@@ -150,6 +173,10 @@ def variable_part(
             "series": [],
             "analysis": {},
             "warnings": [f"{spec.display_name}: {exc}"],
+            "collection_strategy": "failed",
+            "source_products": [],
+            "source_resolution": None,
+            "sampling": {"mode": "all"},
         }
 
 
@@ -169,7 +196,7 @@ def region_part(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        records, warnings, mean_raster, raster_bounds = _collect_chunked(
+        series = _collect_chunked(
             variable_id,
             aoi,
             payload["start_date"],
@@ -178,7 +205,10 @@ def region_part(
             progress=progress,
             progress_label=label,
             should_cancel=should_cancel,
+            options=_collection_options(payload),
         )
+        records = series.records
+        warnings = series.warnings
         analysis = run_series_analysis(
             records,
             payload["analysis_methods"],
@@ -186,8 +216,8 @@ def region_part(
             product=spec.dataset,
             unit=spec.unit,
             label=spec.value_label,
-            mean_raster=mean_raster,
-            raster_bounds=raster_bounds,
+            mean_raster=series.mean_raster,
+            raster_bounds=series.raster_bounds,
             include_visualizations=include_visualizations,
         )
         entry = {
@@ -196,7 +226,7 @@ def region_part(
                 "variable_id": spec.variable_id,
                 "dataset": spec.dataset,
                 "unit": spec.unit,
-                "native_resolution": spec.native_resolution,
+                "native_resolution": series.source_resolution or spec.native_resolution,
             },
             "series": records,
             "data_quality": analysis.get("data_quality", {}),
@@ -214,6 +244,10 @@ def region_part(
             "series": records,
             "analysis": analysis,
             "warnings": entry["warnings"],
+            "collection_strategy": series.collection_strategy,
+            "source_products": series.source_products or [spec.dataset],
+            "source_resolution": series.source_resolution or spec.native_resolution,
+            "sampling": series.sampling or {"mode": "all"},
         }
     except JobCanceled:
         raise
@@ -238,6 +272,10 @@ def region_part(
             "series": [],
             "analysis": {},
             "warnings": [f"{label}: {exc}"],
+            "collection_strategy": "failed",
+            "source_products": [],
+            "source_resolution": None,
+            "sampling": {"mode": "all"},
         }
 
 
@@ -261,6 +299,10 @@ def failed_part(key: str, label: str, exc: BaseException, unit: str = "") -> dic
         "series": [],
         "analysis": {},
         "warnings": [f"{label}: {exc}"],
+        "collection_strategy": "failed",
+        "source_products": [],
+        "source_resolution": None,
+        "sampling": {"mode": "all"},
     }
 
 
@@ -297,6 +339,19 @@ def _all_warnings(parts: list[dict[str, Any]]) -> list[str]:
     return sorted(set(warnings))
 
 
+def _collection_metadata(payload: dict[str, Any], parts: list[dict[str, Any]]) -> dict[str, Any]:
+    resolution = payload.get("temporal_resolution", "daily")
+    first = next((part for part in parts if part.get("status") != "failed"), {})
+    return {
+        "temporal_resolution": resolution,
+        "spatial_strategy": payload.get("spatial_strategy", "coarse") if resolution != "daily" else None,
+        "collection_strategy": first.get("collection_strategy"),
+        "source_products": first.get("source_products", []),
+        "native_resolution": first.get("source_resolution"),
+        "sampling": first.get("sampling", {"mode": "all"}),
+    }
+
+
 def assemble_variable_comparison(
     payload: dict[str, Any], job_id: str, parts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -308,7 +363,7 @@ def assemble_variable_comparison(
             "mode": "variable_comparison",
             "start_date": payload["start_date"],
             "end_date": payload["end_date"],
-            "temporal_resolution": payload.get("temporal_resolution", "daily"),
+            **_collection_metadata(payload, parts),
             "aoi": payload["aoi"],
             "variables": payload["variables"],
             "analysis_methods": payload["analysis_methods"],
@@ -334,7 +389,7 @@ def assemble_region_comparison(
             "dataset": spec.dataset,
             "start_date": payload["start_date"],
             "end_date": payload["end_date"],
-            "temporal_resolution": payload.get("temporal_resolution", "daily"),
+            **_collection_metadata(payload, parts),
             "analysis_methods": payload["analysis_methods"],
             "max_days_per_chunk": MAX_DAYS_PER_DAILY_JOB,
         },

@@ -8,9 +8,10 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.routes.analysis import AOIRequest, MAX_TOTAL_DAYS, PRODUCT_START_DATE
+from app.api.routes.analysis import AOIRequest, MAX_TOTAL_DAYS, PRODUCT_START_DATE, SamplingRequest
 from app.jobs import create_job
 from app.services.analysis_engine import SUPPORTED_METHODS
+from app.services.temporal import resolve_seed
 from app.services.variables import SUPPORTED_VARIABLES
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
@@ -30,7 +31,9 @@ class VariableComparisonRequest(BaseModel):
     aoi: AOIRequest = Field(..., description="Geographic bounding box shared by every variable.")
     start_date: str = Field(..., description="Start date in ISO format YYYY-MM-DD.")
     end_date: str = Field(..., description="End date in ISO format YYYY-MM-DD.")
-    temporal_resolution: Literal["daily"] = Field("daily")
+    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field("daily")
+    spatial_strategy: Literal["coarse", "native"] = Field("coarse")
+    sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     variables: list[str] = Field(
         ...,
         description="Variable ids to compare.",
@@ -47,11 +50,32 @@ class RegionComparisonRequest(BaseModel):
     regions: list[AOIRequest] = Field(..., description="List of bounding boxes.")
     start_date: str = Field(..., description="Start date in ISO format YYYY-MM-DD.")
     end_date: str = Field(..., description="End date in ISO format YYYY-MM-DD.")
-    temporal_resolution: Literal["daily"] = Field("daily")
+    temporal_resolution: Literal["daily", "monthly", "yearly"] = Field("daily")
+    spatial_strategy: Literal["coarse", "native"] = Field("coarse")
+    sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     analysis_methods: list[AnalysisMethod] = Field(
         default_factory=lambda: ["linear_regression", "mann_kendall", "t_test"]
     )
     include_visualizations: bool = Field(True, description="Render base64 PNG charts.")
+
+
+def _collection_options(payload: Any, seed_key: str) -> dict[str, Any]:
+    """Validate and normalise resolution/strategy/sampling for a comparison."""
+    resolution = str(payload.temporal_resolution).lower()
+    strategy = str(payload.spatial_strategy).lower()
+    if resolution == "daily":
+        if payload.sampling.mode != "all":
+            raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
+        if strategy != "coarse":
+            raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
+    sampling = payload.sampling.model_dump()
+    if sampling["mode"] == "random_day_per_month" and sampling["seed"] is None:
+        sampling["seed"] = resolve_seed(None, fallback_key=seed_key)
+    return {
+        "temporal_resolution": resolution,
+        "spatial_strategy": strategy,
+        "sampling": sampling,
+    }
 
 
 def _parse_date(value: str, field_name: str) -> date:
@@ -132,13 +156,17 @@ def compare_variables(payload: VariableComparisonRequest) -> dict[str, Any]:
     variables = _validate_variables(payload.variables)
     methods = _validate_methods(payload.analysis_methods)
     _validate_dates(payload.start_date, payload.end_date)
+    options = _collection_options(
+        payload,
+        seed_key=f"variables|{payload.start_date}|{payload.end_date}|{','.join(variables)}",
+    )
     return _enqueue(
         "variable_comparison",
         {
             "aoi": _validate_aoi(payload.aoi),
             "start_date": payload.start_date,
             "end_date": payload.end_date,
-            "temporal_resolution": payload.temporal_resolution,
+            **options,
             "variables": variables,
             "analysis_methods": methods,
             "include_visualizations": payload.include_visualizations,
@@ -168,6 +196,10 @@ def compare_regions(payload: RegionComparisonRequest) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Duplicate AOI regions are not allowed.")
         seen.add(key)
 
+    options = _collection_options(
+        payload,
+        seed_key=f"regions|{payload.variable}|{payload.start_date}|{payload.end_date}|{regions}",
+    )
     return _enqueue(
         "region_comparison",
         {
@@ -175,7 +207,7 @@ def compare_regions(payload: RegionComparisonRequest) -> dict[str, Any]:
             "regions": regions,
             "start_date": payload.start_date,
             "end_date": payload.end_date,
-            "temporal_resolution": payload.temporal_resolution,
+            **options,
             "analysis_methods": methods,
             "include_visualizations": payload.include_visualizations,
         },

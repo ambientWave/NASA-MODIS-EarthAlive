@@ -197,6 +197,7 @@ def collect_daily_grid(
     variable_names = tuple(variable_names)
     start = date.fromisoformat(request.start_date)
     end = date.fromisoformat(request.end_date)
+    sample_days = set(request.sample_days) if request.sample_days else None
     warnings: list[str] = []
     records: list[dict[str, Any]] = []
 
@@ -226,6 +227,8 @@ def collect_daily_grid(
             request.check_cancel()
             day = current.isoformat()
             current += timedelta(days=1)
+            if sample_days is not None and day not in sample_days:
+                continue
             day_granules = grouped.get(day)
             if not day_granules:
                 records.append(

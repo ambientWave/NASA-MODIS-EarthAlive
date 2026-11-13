@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.jobs import create_job
+from app.services.temporal import resolve_seed
 from app.services.variables import resolve_variable_id
 from app.utils.logging import log
 
@@ -32,6 +33,25 @@ class AOIRequest(BaseModel):
     north: float = Field(..., ge=-90.0, le=90.0, description="Northern latitude boundary in decimal degrees.")
 
 
+class SamplingRequest(BaseModel):
+    """Random observation sampling, used instead of averaging where needed."""
+
+    mode: Literal["all", "random_day_per_month"] = Field(
+        "all",
+        description=(
+            "`all` uses every day or the provider monthly product. "
+            "`random_day_per_month` selects uniformly random real observations, "
+            "which is the fallback for variables without a monthly product."
+        ),
+    )
+    samples_per_month: int = Field(1, ge=1, le=15, description="Random days selected per calendar month.")
+    seed: int | None = Field(None, description="Seed for reproducible sampling; derived from the request when omitted.")
+    missing: Literal["keep", "redraw"] = Field(
+        "keep",
+        description="`keep` leaves a missing sampled day missing; `redraw` replaces it with another candidate day.",
+    )
+
+
 class TrendAnalysisRequest(BaseModel):
     variable: str | None = Field(
         None,
@@ -55,6 +75,14 @@ class TrendAnalysisRequest(BaseModel):
     temporal_resolution: Literal["daily", "monthly", "yearly"] = Field(
         "monthly", description="Aggregation frequency for the MODIS time series."
     )
+    spatial_strategy: Literal["coarse", "native"] = Field(
+        "coarse",
+        description=(
+            "`coarse` reads the provider's monthly product (12 files/year, 0.05° for "
+            "MODIS). `native` aggregates the daily/native product (more files, finer pixels)."
+        ),
+    )
+    sampling: SamplingRequest = Field(default_factory=SamplingRequest)
     analysis_methods: list[Literal[
         "linear_regression",
         "mann_kendall",
@@ -162,6 +190,23 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
             detail=f"Unsupported temporal resolution: '{payload.temporal_resolution}'. Supported values: {sorted(SUPPORTED_TEMPORAL_RESOLUTION)}",
         )
 
+    spatial_strategy = str(payload.spatial_strategy).lower()
+    if temporal_resolution == "daily":
+        if payload.sampling.mode != "all":
+            raise HTTPException(status_code=400, detail="Random sampling requires a monthly or yearly temporal_resolution.")
+        if spatial_strategy != "coarse":
+            raise HTTPException(status_code=400, detail="spatial_strategy only applies to monthly or yearly requests.")
+
+    sampling = payload.sampling.model_dump()
+    if sampling["mode"] == "random_day_per_month" and sampling["seed"] is None:
+        sampling["seed"] = resolve_seed(
+            None,
+            fallback_key=(
+                f"{variable_id}|{start_date.isoformat()}|{end_date.isoformat()}|"
+                f"{aoi['west']},{aoi['south']},{aoi['east']},{aoi['north']}"
+            ),
+        )
+
     requested_methods = [str(method).lower() for method in payload.analysis_methods]
     unsupported_methods = sorted(set(requested_methods) - SUPPORTED_ANALYSIS_METHODS)
     if unsupported_methods:
@@ -178,13 +223,16 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "temporal_resolution": temporal_resolution,
+        "spatial_strategy": spatial_strategy,
+        "sampling": sampling,
         "analysis_methods": requested_methods,
     }
 
     log(
         "trend: request accepted "
         f"variable={variable_id} aoi={aoi} start={start_date} end={end_date} "
-        f"resolution={temporal_resolution} methods={requested_methods}"
+        f"resolution={temporal_resolution} strategy={spatial_strategy} "
+        f"sampling={sampling['mode']} methods={requested_methods}"
     )
     try:
         job_id = create_job("trend_analysis", job_payload)

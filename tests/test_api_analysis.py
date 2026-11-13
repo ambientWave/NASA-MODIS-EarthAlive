@@ -44,6 +44,7 @@ def _fake_collect(records):
         progress_label=None,
         should_cancel=None,
         collector=None,
+        **kwargs,
     ):
         spec = get_variable_spec(variable_id)
         if progress is not None:

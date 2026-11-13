@@ -11,6 +11,41 @@ from app.jobs.errors import raise_if_canceled
 
 
 @dataclass(frozen=True)
+class PeriodSource:
+    """A coarser-temporal product used for monthly/yearly requests.
+
+    These products are produced by the data provider from every source
+    observation (for example MOD11C3 monthly LST), so one file replaces a whole
+    month of daily granules. ``reader`` selects how the file is opened:
+
+    * ``"xarray"`` — netCDF/HDF5 opened through ``earthaccess.open``.
+    * ``"gdal"`` — HDF4 CMG read through the local GDAL warp path.
+    """
+
+    short_name: str
+    version: str
+    variable_names: tuple[str, ...]
+    reader: str = "xarray"
+    native_resolution: str = "monthly"
+    scale: float = 1.0
+    offset: float = 0.0
+    # ``total`` means the provider stores a period accumulation (e.g. mm/month);
+    # it is converted to a per-day rate so every variable keeps the same unit.
+    period_statistic: str = "mean"
+    valid_min: float | None = None
+    valid_max: float | None = None
+    quality_variable: str | None = None
+    quality_value: int | None = None
+    gdal_grid: str | None = None
+    gdal_subdataset: str | None = None
+    gdal_src_nodata: float | None = None
+    gdal_output_type: str = "Float32"
+    gdal_resampling: str = "bilinear"
+    # Grid used when warping the coarse source onto the AOI.
+    analysis_resolution: float = 0.01
+
+
+@dataclass(frozen=True)
 class VariableSpec:
     """Static metadata describing one supported environmental variable."""
 
@@ -20,6 +55,7 @@ class VariableSpec:
     unit: str
     native_resolution: str
     value_label: str
+    monthly_source: PeriodSource | None = None
 
 
 @dataclass
@@ -31,6 +67,13 @@ class CollectionRequest:
     end_date: str
     output_dir: Path
     temporal_resolution: str = "daily"
+    spatial_strategy: str = "coarse"
+    sampling_mode: str = "all"
+    samples_per_month: int = 1
+    sampling_seed: int | None = None
+    sampling_missing: str = "keep"
+    # Populated by the resolver: the exact ISO days selected by random sampling.
+    sample_days: tuple[str, ...] | None = None
     should_cancel: Callable[[], bool] | None = None
     # Optional fine-grained reporting. ``progress`` is the job's callback and is
     # called as ``(stage, label, current, total, percent)``; ``percent`` lets a
@@ -70,6 +113,14 @@ class VariableSeries:
     warnings: list[str] = field(default_factory=list)
     mean_raster: Any = None
     raster_bounds: tuple[float, float, float, float] | None = None
+    # Frequency of ``records``: "daily", "monthly" or "yearly".
+    frequency: str = "daily"
+    # How the series was produced: "daily", "provider_monthly", "sampled" or
+    # "native_aggregated".
+    collection_strategy: str = "daily"
+    source_products: list[str] = field(default_factory=list)
+    source_resolution: str | None = None
+    sampling: dict[str, Any] = field(default_factory=dict)
 
 
 def build_record(

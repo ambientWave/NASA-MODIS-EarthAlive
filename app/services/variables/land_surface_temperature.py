@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.services.modis_timeseries import TimeSeriesConfig, collect_mod11a1_timeseries
-from app.services.variables.base import CollectionRequest, VariableSeries, VariableSpec, build_record
+from app.services.variables.base import CollectionRequest, PeriodSource, VariableSeries, VariableSpec, build_record
 from app.utils.logging import log
 
 SPEC = VariableSpec(
@@ -13,6 +13,21 @@ SPEC = VariableSpec(
     unit="Celsius",
     native_resolution="daily",
     value_label="LST",
+    monthly_source=PeriodSource(
+        short_name="MOD11C3",
+        version="061",
+        variable_names=("LST_Day_CMG",),
+        reader="gdal",
+        native_resolution="0.05°",
+        scale=0.02,
+        offset=-273.15,
+        valid_min=7500.0,
+        valid_max=65535.0,
+        gdal_grid="MODIS_Grid_Monthly_CMG_LST",
+        gdal_subdataset="LST_Day_CMG",
+        gdal_src_nodata=0.0,
+        analysis_resolution=0.01,
+    ),
 )
 
 
