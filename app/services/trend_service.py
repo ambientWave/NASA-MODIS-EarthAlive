@@ -169,17 +169,6 @@ def execute_trend_analysis(
             }
         )
         log(f"trend: job {job_id} validation failed: {exc} reasons={reasons[:3]}")
-        if any("gdal_translate was not found" in reason for reason in reasons):
-            raise JobError(
-                503,
-                (
-                    "Processing environment is not configured: "
-                    "gdal_translate with HDF4 support was not found. "
-                    "Install GDAL (OSGeo4W or conda-forge) and put it on PATH, "
-                    "or set the GDAL_TRANSLATE environment variable to its full path."
-                ),
-            ) from exc
-
         detail = f"No valid observations: {exc}"
         if reasons:
             detail += f" Reasons: {'; '.join(reasons[:3])}"

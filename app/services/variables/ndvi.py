@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
@@ -363,7 +364,129 @@ def _record_for_day(
     )
 
 
+def collect_ndvi_appeears(request: CollectionRequest) -> VariableSeries:
+    """Collect NDVI composites using NASA AppEEARS Analysis-Ready Data."""
+    from app.services.appeears_client import AppEEARSClient
+    from app.services.modis_timeseries import parse_appeears_filename_date
+
+    bounds = (request.aoi["west"], request.aoi["south"], request.aoi["east"], request.aoi["north"])
+    product_and_version = f"{PRODUCT}.061"
+
+    ndvi_layer = f"_{CONFIG['ndvi'].replace(' ', '_')}"
+    qa_layer = f"_{CONFIG['qa'].replace(' ', '_')}"
+
+    client = AppEEARSClient()
+    client.login()
+
+    task_name = f"ndvi_{request.start_date.replace('-', '')}"
+    task_id = client.submit_area_task(
+        task_name=task_name,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        layers=[
+            (product_and_version, ndvi_layer),
+            (product_and_version, qa_layer),
+        ],
+        bbox=request.aoi,
+        file_type="geotiff",
+        projection="geographic",
+    )
+
+    request.check_cancel()
+    client.wait_for_task(
+        task_id=task_id,
+        should_cancel=request.should_cancel,
+        on_progress=lambda pct, msg: request.report(pct, 100, detail=msg),
+    )
+
+    out_dir = Path(request.output_dir or _cache_root()) / "raw_appeears"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = client.download_bundle(task_id, target_dir=out_dir, file_patterns=(".tif",))
+
+    files_by_date: dict[str, dict[str, Path]] = {}
+    for p in downloaded:
+        d_str = parse_appeears_filename_date(p.name)
+        if not d_str:
+            continue
+        entry = files_by_date.setdefault(d_str, {})
+        if "NDVI" in p.name.upper():
+            entry["ndvi"] = p
+        elif "PIXEL_RELIABILITY" in p.name.upper() or "RELIABILITY" in p.name.upper():
+            entry["qa"] = p
+
+    composite_records: dict[str, dict[str, Any]] = {}
+    raster_sum: np.ndarray | None = None
+    raster_count: np.ndarray | None = None
+    warnings: list[str] = []
+
+    for comp_date in sorted(files_by_date):
+        day_files = files_by_date[comp_date]
+        ndvi_file = day_files.get("ndvi")
+        qa_file = day_files.get("qa")
+        if not ndvi_file:
+            continue
+
+        raw_ndvi, _ = read_raster(ndvi_file)
+        valid_mask = (raw_ndvi >= -2000) & (raw_ndvi <= 10000)
+        if qa_file:
+            raw_qa, _ = read_raster(qa_file)
+            qa_valid = (raw_qa == 0) | (raw_qa == 1)
+            valid_mask = valid_mask & qa_valid
+
+        valid_vals = raw_ndvi[valid_mask] * 0.0001
+        valid_pixels = int(valid_vals.size)
+        total_pixels = int(raw_ndvi.size)
+        val = float(np.mean(valid_vals)) if valid_pixels > 0 else None
+
+        composite_records[comp_date] = {
+            "value": val,
+            "valid_pixels": valid_pixels,
+            "total_pixels": total_pixels,
+            "granules": [ndvi_file.name] + ([qa_file.name] if qa_file else []),
+        }
+
+        grid = np.full(raw_ndvi.shape, np.nan, dtype=np.float32)
+        grid[valid_mask] = valid_vals
+        finite = np.isfinite(grid)
+        if np.any(finite):
+            if raster_sum is None:
+                raster_sum = np.zeros(grid.shape, dtype=np.float64)
+                raster_count = np.zeros(grid.shape, dtype=np.int32)
+            raster_sum[finite] += grid[finite]
+            raster_count[finite] += 1
+
+    sample_days = sorted(request.sample_days) if request.sample_days else None
+    if sample_days:
+        records = [_record_for_day(day, composite_records, sampled=True) for day in sample_days]
+    else:
+        records = []
+        current = date.fromisoformat(request.start_date)
+        end = date.fromisoformat(request.end_date)
+        while current <= end:
+            records.append(_record_for_day(current.isoformat(), composite_records))
+            current += timedelta(days=1)
+
+    mean_raster = None
+    if raster_sum is not None and raster_count is not None:
+        mean_raster = np.full(raster_sum.shape, np.nan, dtype=np.float32)
+        valid = raster_count > 0
+        mean_raster[valid] = (raster_sum[valid] / raster_count[valid]).astype(np.float32)
+
+    return VariableSeries(
+        spec=SPEC,
+        records=records,
+        warnings=warnings,
+        mean_raster=mean_raster,
+        raster_bounds=bounds,
+    )
+
+
 def collect(request: CollectionRequest) -> VariableSeries:
+    provider = os.getenv("NDVI_PROVIDER", "appeears").lower().strip()
+    if provider != "earthaccess":
+        log("variables: ndvi: using NASA AppEEARS ARD extraction pipeline")
+        return collect_ndvi_appeears(request)
+
     bounds = (request.aoi["west"], request.aoi["south"], request.aoi["east"], request.aoi["north"])
     resolution = float(CONFIG["resolution_deg"])
     width, height = destination_grid_size(bounds, resolution)

@@ -27,6 +27,9 @@ class Settings:
     earthdata_password: str | None
     earthdata_token: str | None
     earthdata_auth_strategy: str
+    appeears_base_url: str = "https://appeears.earthdatacloud.nasa.gov/api"
+    modis_provider: str = "appeears"
+    ndvi_provider: str = "appeears"
 
     @property
     def has_username_password(self) -> bool:
@@ -64,11 +67,18 @@ def get_settings() -> Settings:
         strategy = "environment" if (username and password) or token else "netrc"
     strategy = strategy.lower()
 
+    appeears_base_url = _clean(os.getenv("APPEEARS_BASE_URL")) or "https://appeears.earthdatacloud.nasa.gov/api"
+    modis_provider = (_clean(os.getenv("MODIS_PROVIDER")) or "appeears").lower()
+    ndvi_provider = (_clean(os.getenv("NDVI_PROVIDER")) or "appeears").lower()
+
     settings = Settings(
         earthdata_username=username,
         earthdata_password=password,
         earthdata_token=token,
         earthdata_auth_strategy=strategy,
+        appeears_base_url=appeears_base_url,
+        modis_provider=modis_provider,
+        ndvi_provider=ndvi_provider,
     )
     settings.validate()
     return settings

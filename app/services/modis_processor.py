@@ -256,28 +256,43 @@ def extract_subdataset_to_tiff(
     output_tif: str | Path,
     grid_name: str = "MODIS_Grid_Daily_1km_LST",
 ) -> Path:
-    gdal_translate = find_gdal_translate()
     hdf_path = str(hdf_path)
     output_tif = Path(output_tif)
     output_tif.parent.mkdir(parents=True, exist_ok=True)
     gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":{grid_name}:{subdataset_name}'
-    subprocess.run(
-        [
-            gdal_translate,
-            "-of",
-            "GTiff",
-            "-co",
-            "COMPRESS=LZW",
-            "-a_nodata",
-            "0",
-            gdal_uri,
-            str(output_tif),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    log(f"modis: wrote {output_tif.name}")
+
+    try:
+        gdal_translate = find_gdal_translate()
+    except RuntimeError:
+        gdal_translate = None
+
+    if gdal_translate:
+        subprocess.run(
+            [
+                gdal_translate,
+                "-of",
+                "GTiff",
+                "-co",
+                "COMPRESS=LZW",
+                "-a_nodata",
+                "0",
+                gdal_uri,
+                str(output_tif),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        log(f"modis: wrote {output_tif.name}")
+        return output_tif
+
+    with rasterio.open(gdal_uri) as src:
+        profile = src.profile.copy()
+        profile.update(driver="GTiff", compress="lzw", nodata=0)
+        data = src.read(1)
+        with rasterio.open(output_tif, "w", **profile) as dst:
+            dst.write(data, 1)
+    log(f"modis: wrote {output_tif.name} (rasterio)")
     return output_tif
 
 
@@ -318,57 +333,74 @@ def warp_subdataset_to_aoi(
     dst_nodata: float | None = None,
     output_type: str | None = None,
 ) -> Path:
-    """Warp one HDF4 subdataset straight onto the AOI's WGS84 grid.
+    """Warp one subdataset onto the AOI's WGS84 grid.
 
-    This replaces the old ``gdal_translate`` full-tile dump followed by a
-    ``rasterio`` read and ``reproject``. GDAL only reads the source window that
-    covers ``bounds``, so a national AOI costs a fraction of the full tile, and
-    the numpy side gets an array that is already on the destination grid.
+    Prefers gdalwarp if installed, otherwise falls back to pure rasterio reprojection.
     """
-    gdalwarp = find_gdalwarp()
-    hdf_path = str(hdf_path)
     output_tif = Path(output_tif)
     output_tif.parent.mkdir(parents=True, exist_ok=True)
     gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":{grid_name}:{subdataset_name}'
     west, south, east, north = bounds
 
-    command = [
-        gdalwarp,
-        "-q",
-        "-overwrite",
-        "-t_srs",
-        "EPSG:4326",
-        "-te",
-        str(west),
-        str(south),
-        str(east),
-        str(north),
-        # -ts (not -tr) guarantees the array matches destination_grid_size().
-        "-ts",
-        str(int(width)),
-        str(int(height)),
-        "-r",
-        resampling,
-        "-of",
-        "GTiff",
-        "-co",
-        "COMPRESS=LZW",
-        "-co",
-        "TILED=YES",
-        "-co",
-        "PREDICTOR=2",
-        "-co",
-        "BIGTIFF=IF_SAFER",
-    ]
-    if src_nodata is not None:
-        command += ["-srcnodata", str(src_nodata)]
-    if dst_nodata is not None:
-        command += ["-dstnodata", str(dst_nodata)]
-    if output_type:
-        command += ["-ot", output_type]
-    command += [gdal_uri, str(output_tif)]
+    try:
+        gdalwarp = find_gdalwarp()
+    except RuntimeError:
+        gdalwarp = None
 
-    subprocess.run(command, check=True, capture_output=True, text=True)
+    if gdalwarp:
+        command = [
+            gdalwarp,
+            "-q",
+            "-overwrite",
+            "-t_srs",
+            "EPSG:4326",
+            "-te",
+            str(west),
+            str(south),
+            str(east),
+            str(north),
+            "-ts",
+            str(int(width)),
+            str(int(height)),
+            "-r",
+            resampling,
+            "-of",
+            "GTiff",
+            "-co",
+            "COMPRESS=LZW",
+            "-co",
+            "TILED=YES",
+            "-co",
+            "PREDICTOR=2",
+            "-co",
+            "BIGTIFF=IF_SAFER",
+        ]
+        if src_nodata is not None:
+            command += ["-srcnodata", str(src_nodata)]
+        if dst_nodata is not None:
+            command += ["-dstnodata", str(dst_nodata)]
+        if output_type:
+            command += ["-ot", output_type]
+        command += [gdal_uri, str(output_tif)]
+
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return output_tif
+
+    with rasterio.open(gdal_uri) as src:
+        src_data = src.read(1)
+        src_profile = src.profile.copy()
+        reprojected = reproject_to_4326(src_data, src_profile, bounds, width, height)
+        dst_profile = src_profile.copy()
+        dst_profile.update(
+            driver="GTiff",
+            crs="EPSG:4326",
+            transform=from_bounds(*bounds, width=width, height=height),
+            width=width,
+            height=height,
+            nodata=dst_nodata if dst_nodata is not None else np.nan,
+        )
+        with rasterio.open(output_tif, "w", **dst_profile) as dst:
+            dst.write(reprojected.astype(np.float32), 1)
     return output_tif
 
 
@@ -438,7 +470,134 @@ def generate_heatmap(array: np.ndarray, bounds: tuple[float, float, float, float
     plt.close(fig)
 
 
+def process_appeears_raster_pair(
+    lst_path: str | Path,
+    qc_path: str | Path | None = None,
+) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    """Process an AppEEARS-extracted LST_Day_1km and QC_Day GeoTIFF pair.
+
+    AppEEARS provides the mosaic already subsetted and reprojected to EPSG:4326.
+    Reads via rasterio directly, applies QA filter and Kelvin->Celsius conversion.
+    """
+    warnings: list[str] = []
+    lst_path = Path(lst_path)
+    if not lst_path.is_file():
+        raise FileNotFoundError(f"AppEEARS LST file not found: {lst_path}")
+
+    lst_data, lst_profile = read_raster(lst_path)
+    mask = valid_lst_mask(lst_data)
+
+    if qc_path and Path(qc_path).is_file():
+        qc_data, _ = read_raster(qc_path)
+        mask = mask & mandatory_qa_mask(qc_data)
+
+    celsius_grid = np.full(lst_data.shape, np.nan, dtype=np.float32)
+    valid_values = convert_kelvin_to_celsius(lst_data[mask])
+    celsius_grid[mask] = valid_values
+
+    valid_count = int(np.count_nonzero(mask))
+    total_count = int(lst_data.size)
+    mean_val = float(np.mean(valid_values)) if valid_count > 0 else None
+    min_val = float(np.min(valid_values)) if valid_count > 0 else None
+    max_val = float(np.max(valid_values)) if valid_count > 0 else None
+
+    summary = {
+        "mean_temperature_celsius": mean_val,
+        "minimum_temperature_celsius": min_val,
+        "maximum_temperature_celsius": max_val,
+        "valid_pixels": valid_count,
+        "total_pixels": total_count,
+        "valid_data_percentage": 0.0 if total_count == 0 else float((valid_count / total_count) * 100.0),
+    }
+    return celsius_grid, warnings, summary
+
+
+def run_modis_appeears_pipeline(
+    date_str: str = "2024-01-01",
+    bbox: dict[str, float] | None = None,
+    output_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Run end-to-end MOD11A1 pipeline using AppEEARS Analysis-Ready Data.
+
+    Bypasses local GDAL/HDF4 compilation dependencies by leveraging AppEEARS cloud
+    subsetting and reprojection to EPSG:4326.
+    """
+    from app.services.modis_downloader import download_mod11a1_appeears
+
+    bbox = bbox or EGYPT_BBOX
+    out_dir = Path(output_dir) if output_dir is not None else PROCESSED_DATA_DIR / "egypt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = out_dir / "raw"
+
+    log(f"modis: submitting AppEEARS pipeline task for {date_str}")
+    downloaded_files = download_mod11a1_appeears(
+        date_str=date_str,
+        bbox=bbox,
+        target_dir=raw_dir,
+    )
+
+    lst_file = next((f for f in downloaded_files if "LST_Day_1km" in f.name and f.suffix == ".tif"), None)
+    qc_file = next((f for f in downloaded_files if "QC_Day" in f.name and f.suffix == ".tif"), None)
+
+    if not lst_file:
+        raise RuntimeError(f"AppEEARS bundle did not contain LST_Day_1km GeoTIFF for {date_str}")
+
+    celsius_grid, warnings, summary = process_appeears_raster_pair(lst_file, qc_file)
+    bounds = (bbox["west"], bbox["south"], bbox["east"], bbox["north"])
+
+    final_raster_path = out_dir / f"egypt_lst_day_{date_str.replace('-', '_')}.tif"
+    heatmap_path = out_dir / f"egypt_lst_heatmap_{date_str.replace('-', '_')}.png"
+    report_path = out_dir / f"egypt_modis_report_{date_str.replace('-', '_')}.json"
+
+    with rasterio.open(
+        final_raster_path,
+        "w",
+        driver="GTiff",
+        height=celsius_grid.shape[0],
+        width=celsius_grid.shape[1],
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_bounds(*bounds, width=celsius_grid.shape[1], height=celsius_grid.shape[0]),
+        nodata=np.nan,
+    ) as dst:
+        dst.write(celsius_grid.astype(np.float32), 1)
+
+    generate_heatmap(celsius_grid, bounds, f"MODIS Land Surface Temperature — {date_str}", heatmap_path)
+
+    report = {
+        "date": date_str,
+        "product_name": "MOD11A1",
+        "collection_version": "061",
+        "provider": "NASA AppEEARS",
+        "bounding_box": bbox,
+        "total_pixels": summary["total_pixels"],
+        "valid_pixels": summary["valid_pixels"],
+        "mean_temperature_celsius": summary["mean_temperature_celsius"],
+        "minimum_temperature_celsius": summary["minimum_temperature_celsius"],
+        "maximum_temperature_celsius": summary["maximum_temperature_celsius"],
+        "crs": "EPSG:4326",
+        "processing_warnings": warnings,
+    }
+
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+
+    return {
+        "date": date_str,
+        "granules": [str(p) for p in downloaded_files],
+        "raster_path": str(final_raster_path),
+        "heatmap_path": str(heatmap_path),
+        "report_path": str(report_path),
+        **summary,
+        "warnings": warnings,
+    }
+
+
 def run_modis_egypt_pipeline(date_str: str = "2024-01-01") -> dict[str, Any]:
+    provider = os.getenv("MODIS_PROVIDER", "appeears").lower().strip()
+    if provider != "earthaccess":
+        return run_modis_appeears_pipeline(date_str)
     ensure_earthaccess_auth()
     log(f"modis: running daily pipeline for {date_str}")
     granules = discover_mod11a1_granules(date_str=date_str)

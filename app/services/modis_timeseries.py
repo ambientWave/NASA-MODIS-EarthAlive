@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -367,7 +369,172 @@ def save_timeseries_outputs(records: list[dict[str, Any]], output_dir: str | Pat
     return {"csv": str(csv_path), "json": str(json_path)}
 
 
+def parse_appeears_filename_date(filename: str) -> str | None:
+    """Extract YYYY-MM-DD date from AppEEARS output bundle filename."""
+    doy_match = re.search(r"doy(\d{4})(\d{3})", filename, re.IGNORECASE)
+    if doy_match:
+        year = int(doy_match.group(1))
+        doy = int(doy_match.group(2))
+        return (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y-%m-%d")
+
+    cal_match = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", filename)
+    if cal_match:
+        y, m, d = cal_match.groups()
+        try:
+            dt = datetime(int(y), int(m), int(d))
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
+def collect_mod11a1_timeseries_appeears(config: TimeSeriesConfig) -> dict[str, Any]:
+    """Extract a MOD11A1 timeseries cube using NASA AppEEARS Analysis-Ready Data.
+
+    Bypasses local tile downloading and GDAL reprojection.
+    """
+    from app.services.appeears_client import AppEEARSClient
+    from app.services.modis_processor import process_appeears_raster_pair
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    client = AppEEARSClient()
+    client.login()
+
+    task_name = f"lst_{config.region_name}_{config.start_date.replace('-', '')}"
+    task_id = client.submit_area_task(
+        task_name=task_name,
+        start_date=config.start_date,
+        end_date=config.end_date,
+        layers=[
+            ("MOD11A1.061", "LST_Day_1km"),
+            ("MOD11A1.061", "QC_Day"),
+        ],
+        bbox=config.aoi,
+        file_type="geotiff",
+        projection="geographic",
+    )
+
+    client.wait_for_task(
+        task_id=task_id,
+        should_cancel=config.should_cancel,
+    )
+
+    downloaded = client.download_bundle(
+        task_id=task_id,
+        target_dir=raw_dir,
+        file_patterns=(".tif",),
+    )
+
+    files_by_date: dict[str, dict[str, Path]] = {}
+    for p in downloaded:
+        d_str = parse_appeears_filename_date(p.name)
+        if not d_str:
+            continue
+        entry = files_by_date.setdefault(d_str, {})
+        if "LST_Day_1km" in p.name:
+            entry["lst"] = p
+        elif "QC_Day" in p.name:
+            entry["qc"] = p
+
+    date_list = date_range(config.start_date, config.end_date)
+    records: list[dict[str, Any]] = []
+    raster_sum: np.ndarray | None = None
+    raster_count: np.ndarray | None = None
+
+    for index, date_str in enumerate(date_list, start=1):
+        if config.should_cancel is not None and config.should_cancel():
+            raise JobCanceled()
+
+        log_progress("timeseries: date", index, len(date_list), date_str)
+        day_files = files_by_date.get(date_str, {})
+        lst_file = day_files.get("lst")
+        qc_file = day_files.get("qc")
+
+        if not lst_file:
+            records.append(build_missing_observation_record(date_str, "No AppEEARS raster returned for date."))
+            continue
+
+        merged, warnings, summary = process_appeears_raster_pair(lst_file, qc_file)
+        if merged is not None:
+            finite = np.isfinite(merged)
+            if np.any(finite):
+                if raster_sum is None:
+                    raster_sum = np.zeros(merged.shape, dtype=np.float64)
+                    raster_count = np.zeros(merged.shape, dtype=np.int32)
+                raster_sum[finite] += merged[finite]
+                raster_count[finite] += 1
+
+        obs_record = {
+            "observation_date": date_str,
+            "mean_temperature_celsius": summary.get("mean_temperature_celsius"),
+            "minimum_temperature_celsius": summary.get("minimum_temperature_celsius"),
+            "maximum_temperature_celsius": summary.get("maximum_temperature_celsius"),
+            "valid_pixels": summary.get("valid_pixels", 0),
+            "total_pixels": summary.get("total_pixels", 0),
+            "valid_data_percentage": summary.get("valid_data_percentage", 0.0),
+            "missing_observation": summary.get("valid_pixels", 0) == 0,
+            "missing_reason": None if summary.get("valid_pixels", 0) > 0 else "No valid pixels after MODIS QA filtering.",
+            "granules_used": [lst_file.name] + ([qc_file.name] if qc_file else []),
+            "coverage_status": "complete" if summary.get("valid_pixels", 0) > 0 else "missing",
+            "warnings": warnings,
+        }
+
+        if summary.get("valid_pixels", 0) == 0:
+            records.append(
+                build_missing_observation_record(
+                    date_str,
+                    "; ".join(dict.fromkeys(warnings)) or "No valid pixels after QA filtering.",
+                    warnings=warnings,
+                    granules_used=[lst_file.name],
+                    total_pixels=int(summary.get("total_pixels", 0) or 0),
+                )
+            )
+        else:
+            records.append(obs_record)
+
+    if config.temporal_aggregation != "daily":
+        log(f"timeseries: aggregating {len(records)} daily records to {config.temporal_aggregation}")
+        records = aggregate_period_records(records, config.temporal_aggregation)
+
+    region_name = config.region_name
+    output_files = save_timeseries_outputs(records, output_dir, region_name, config.temporal_aggregation)
+
+    mean_raster = None
+    if raster_sum is not None and raster_count is not None:
+        mean_raster = np.full(raster_sum.shape, np.nan, dtype=np.float32)
+        valid = raster_count > 0
+        mean_raster[valid] = (raster_sum[valid] / raster_count[valid]).astype(np.float32)
+
+    return {
+        "region_name": region_name,
+        "aoi": config.aoi,
+        "start_date": config.start_date,
+        "end_date": config.end_date,
+        "product_short_name": config.product_short_name,
+        "temporal_aggregation": config.temporal_aggregation,
+        "records": records,
+        "output_files": output_files,
+        "cache_path": str(config.cache_path),
+        "mean_lst_raster": mean_raster,
+        "raster_bounds": (
+            config.aoi["west"],
+            config.aoi["south"],
+            config.aoi["east"],
+            config.aoi["north"],
+        ),
+    }
+
+
 def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
+    provider = os.getenv("MODIS_PROVIDER", "appeears").lower().strip()
+    if provider != "earthaccess":
+        log("timeseries: using NASA AppEEARS ARD extraction pipeline")
+        return collect_mod11a1_timeseries_appeears(config)
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     # Fail fast when GDAL is unavailable, instead of recording every date as

@@ -5,6 +5,7 @@ from typing import Any
 import earthaccess
 
 from app.core.config import get_settings
+from app.services.appeears_client import AppEEARSClient
 from app.utils.logging import log
 
 
@@ -42,3 +43,17 @@ def ensure_earthaccess_auth(persist: bool = False) -> Any:
         )
     log(f"earthdata: authenticated using strategy '{strategy}'")
     return auth
+
+
+def ensure_appeears_auth(client: AppEEARSClient | None = None) -> str:
+    """Authenticate with NASA AppEEARS API using Earthdata credentials.
+
+    Returns the Bearer token upon success or raises ConnectionError.
+    """
+    client = client or AppEEARSClient()
+    try:
+        token = client.login()
+        return token
+    except Exception as exc:
+        log(f"appeears: authentication failed: {exc}")
+        raise ConnectionError(f"NASA AppEEARS authentication failed: {exc}") from exc
