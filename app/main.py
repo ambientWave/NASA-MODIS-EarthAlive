@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import analysis, health, variables
+from app.api.routes import analysis, comparison, health, variables
 
 
 app = FastAPI(
@@ -33,6 +33,11 @@ app.include_router(
 
 app.include_router(
     analysis.router,
+    prefix="/api/v1"
+)
+
+app.include_router(
+    comparison.router,
     prefix="/api/v1"
 )
 

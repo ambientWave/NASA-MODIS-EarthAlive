@@ -302,6 +302,9 @@ def linear_regression_analysis(records: Iterable[dict[str, Any]]) -> dict[str, A
         "n": int(len(df)),
         "slope_celsius_per_year": float(slope),
         "intercept_celsius": float(intercept),
+        "slope_per_year": float(slope),
+        "intercept": float(intercept),
+        "value_units": "value-units-per-year",
         "r_squared": float(r_squared),
         "p_value": float(p_value),
         "standard_error": float(stderr),
@@ -524,6 +527,7 @@ def _newey_west_hac(x: np.ndarray, y: np.ndarray, lag: int | None = None) -> tup
         "lag": int(lag),
         "selection_method": "automatic Newey-West lag = min(sqrt(n), n/5)",
         "slope_celsius_per_year": float(slope),
+        "slope_per_year": float(slope),
         "standard_error": float(slope_se),
         "p_value": float(p_value),
         "confidence_interval_95": {"lower": float(ci_low), "upper": float(ci_high)},
@@ -575,6 +579,7 @@ def hac_regression_analysis(records: Iterable[dict[str, Any]], lag: int | None =
         "status": result["status"],
         "n": int(len(df)),
         "slope_celsius_per_year": float(slope),
+        "slope_per_year": float(slope),
         "standard_error": float(slope_se),
         "lag": result.get("lag"),
         "lag_selection_method": result.get("selection_method"),
@@ -758,6 +763,8 @@ def _render_linear_regression(
     result: dict[str, Any],
     aoi: dict[str, float],
     product: str,
+    unit: str = "°C",
+    label: str = "LST",
 ) -> dict[str, str]:
     fig, ax = plt.subplots(figsize=(10, 5))
     x = (df["observation_date"] - df["observation_date"].min()).dt.total_seconds() / (365.25 * 86400.0)
@@ -769,16 +776,16 @@ def _render_linear_regression(
         fit_y = float(slope) * fit_x + float(intercept)
         fit_dates = df["observation_date"].min() + pd.to_timedelta(fit_x * 365.25, unit="D")
         ax.plot(fit_dates, fit_y, color="tab:red", linewidth=2, label="Linear fit")
-    ax.set_title(f"{product} LST Linear Regression — AOI {aoi}")
+    ax.set_title(f"{product} {label} Linear Regression — AOI {aoi}")
     ax.set_xlabel("Date")
-    ax.set_ylabel("Mean LST (°C)")
+    ax.set_ylabel(f"Mean {label} ({unit})")
     ax.legend(loc="best")
     ax.text(
         0.02,
         0.98,
         "\n".join(
             [
-                f"slope: {_format_metric(slope)} °C/year",
+                f"slope: {_format_metric(slope)} {unit}/year",
                 f"p-value: {_format_metric(result.get('p_value'))}",
                 f"R²: {_format_metric(result.get('r_squared'))}",
                 f"n: {result.get('n', len(df))}",
@@ -800,10 +807,11 @@ def _render_mann_kendall(
     result: dict[str, Any],
     product: str,
     label: str,
+    unit: str = "°C",
 ) -> dict[str, str]:
     return _render_series_with_annotation(
         df,
-        f"{product} LST {label} — AOI",
+        f"{product} {label} Mann-Kendall — AOI",
         [
             f"trend: {result.get('trend_direction', 'n/a')}",
             f"S: {_format_metric(result.get('s_statistic'))}",
@@ -811,6 +819,7 @@ def _render_mann_kendall(
             f"p-value: {_format_metric(result.get('p_value'))}",
             f"n: {result.get('n', len(df))}",
         ],
+        ylabel=f"Mean {label} ({unit})",
     )
 
 
@@ -818,11 +827,13 @@ def _render_modified_mann_kendall(
     df: pd.DataFrame,
     result: dict[str, Any],
     product: str,
+    label: str,
+    unit: str = "°C",
 ) -> dict[str, str]:
     details = result.get("modified_mann_kendall") or result.get("standard_mann_kendall") or {}
     return _render_series_with_annotation(
         df,
-        f"{product} LST Modified Mann-Kendall — AOI",
+        f"{product} {label} Modified Mann-Kendall — AOI",
         [
             f"status: {result.get('status', 'n/a')}",
             f"method: {result.get('selected_method', details.get('method', 'n/a'))}",
@@ -831,6 +842,7 @@ def _render_modified_mann_kendall(
             f"p-value: {_format_metric(details.get('p_value'))}",
             f"autocorrelation: {_format_metric(result.get('autocorrelation_coefficient'))}",
         ],
+        ylabel=f"Mean {label} ({unit})",
     )
 
 
@@ -838,14 +850,16 @@ def _render_seasonal_mann_kendall(
     df: pd.DataFrame,
     result: dict[str, Any],
     product: str,
+    label: str,
+    unit: str = "°C",
 ) -> dict[str, str]:
     if result.get("status") == "calculated":
         monthly_means = df.groupby(df["observation_date"].dt.month)["mean_lst"].mean()
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.bar(monthly_means.index.astype(int), monthly_means.to_numpy(), color="tab:green")
-        ax.set_title(f"{product} LST Seasonal Mann-Kendall — monthly means")
+        ax.set_title(f"{product} {label} Seasonal Mann-Kendall — monthly means")
         ax.set_xlabel("Calendar month")
-        ax.set_ylabel("Mean LST (°C)")
+        ax.set_ylabel(f"Mean {label} ({unit})")
         ax.set_xticks(range(1, 13))
         ax.text(
             0.02,
@@ -869,11 +883,12 @@ def _render_seasonal_mann_kendall(
 
     return _render_series_with_annotation(
         df,
-        f"{product} LST Seasonal Mann-Kendall — AOI",
+        f"{product} {label} Seasonal Mann-Kendall — AOI",
         [
             f"status: {result.get('status', 'n/a')}",
             str(result.get("reason") or result.get("insufficient_data_reason") or ""),
         ],
+        ylabel=f"Mean {label} ({unit})",
     )
 
 
@@ -881,14 +896,17 @@ def _render_t_test(
     df: pd.DataFrame,
     result: dict[str, Any],
     product: str,
+    label: str,
+    unit: str = "°C",
 ) -> dict[str, str]:
     period_a = result.get("period_a")
     period_b = result.get("period_b")
     if not period_a or not period_b:
         return _render_series_with_annotation(
             df,
-            f"{product} LST Period Comparison — AOI",
+            f"{product} {label} Period Comparison — AOI",
             [f"status: {result.get('status', 'insufficient_data')}", str(result.get("reason") or "")],
+            ylabel=f"Mean {label} ({unit})",
         )
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -898,8 +916,8 @@ def _render_t_test(
     ]
     means = [float(period_a.get("mean", 0.0)), float(period_b.get("mean", 0.0))]
     ax.bar(labels, means, color=["tab:blue", "tab:orange"])
-    ax.set_title(f"{product} LST Period Comparison — AOI")
-    ax.set_ylabel("Mean LST (°C)")
+    ax.set_title(f"{product} {label} Period Comparison — AOI")
+    ax.set_ylabel(f"Mean {label} ({unit})")
     ax.text(
         0.02,
         0.98,
@@ -925,6 +943,8 @@ def _render_heatmap(
     bounds: tuple[float, float, float, float],
     product: str,
     aoi: dict[str, float],
+    unit: str = "°C",
+    label: str = "LST",
 ) -> dict[str, str]:
     fig, ax = plt.subplots(figsize=(10, 8))
     masked = np.ma.masked_invalid(np.asarray(array, dtype=np.float32))
@@ -934,8 +954,8 @@ def _render_heatmap(
         origin="upper",
         extent=[bounds[0], bounds[2], bounds[1], bounds[3]],
     )
-    fig.colorbar(image, ax=ax, label="Mean temperature (°C)")
-    ax.set_title(f"{product} Mean LST Heatmap — AOI {aoi}")
+    fig.colorbar(image, ax=ax, label=f"Mean {label} ({unit})")
+    ax.set_title(f"{product} Mean {label} Heatmap — AOI {aoi}")
     ax.set_xlabel("Longitude (°)")
     ax.set_ylabel("Latitude (°)")
     fig.tight_layout()
@@ -949,6 +969,8 @@ def generate_trend_visualizations(
     product: str,
     mean_raster: np.ndarray | None = None,
     raster_bounds: tuple[float, float, float, float] | None = None,
+    unit: str = "°C",
+    label: str = "LST",
 ) -> dict[str, dict[str, str]]:
     """Build the trend response ``visualizations`` mapping.
 
@@ -960,7 +982,7 @@ def generate_trend_visualizations(
 
     if mean_raster is not None and raster_bounds is not None:
         try:
-            visualizations["heatmap"] = _render_heatmap(mean_raster, raster_bounds, product, aoi)
+            visualizations["heatmap"] = _render_heatmap(mean_raster, raster_bounds, product, aoi, unit=unit, label=label)
         except Exception as exc:  # pragma: no cover - rendering guard
             log(f"visualizations: could not render heatmap: {type(exc).__name__}: {exc}")
 
@@ -971,11 +993,11 @@ def generate_trend_visualizations(
         return visualizations
 
     renderers = {
-        "linear_regression": lambda result: _render_linear_regression(df, result, aoi, product),
-        "mann_kendall": lambda result: _render_mann_kendall(df, result, product, "Mann-Kendall"),
-        "modified_mann_kendall": lambda result: _render_modified_mann_kendall(df, result, product),
-        "seasonal_mann_kendall": lambda result: _render_seasonal_mann_kendall(df, result, product),
-        "t_test": lambda result: _render_t_test(df, result, product),
+        "linear_regression": lambda result: _render_linear_regression(df, result, aoi, product, unit=unit, label=label),
+        "mann_kendall": lambda result: _render_mann_kendall(df, result, product, label, unit=unit),
+        "modified_mann_kendall": lambda result: _render_modified_mann_kendall(df, result, product, label, unit=unit),
+        "seasonal_mann_kendall": lambda result: _render_seasonal_mann_kendall(df, result, product, label, unit=unit),
+        "t_test": lambda result: _render_t_test(df, result, product, label, unit=unit),
     }
 
     for method, result in analysis_results.items():

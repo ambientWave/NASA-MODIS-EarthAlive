@@ -333,10 +333,118 @@ apt-get install -y --no-install-recommends curl libexpat1 libgomp1
 
 ---
 
+## 2026-11-13 - Multi-variable and multi-region comparison jobs
+
+Added background comparison analysis on top of the existing MOD11A1 pipeline, then moved the legacy trend endpoint onto the same queue so every analysis request is asynchronous.
+
+### Queue choice: RQ + Redis instead of BullMQ
+
+BullMQ is a Node.js library; using it would add a second runtime and JavaScript workers to a Python-only backend. RQ is the closest Python equivalent: it uses Redis, needs no broker beyond that, and its worker is a single CLI command.
+
+```yaml
+worker:
+  command: ["rq", "worker", "--url", "redis://redis:6379/0", "analysis"]
+```
+
+`docker-compose.yml` now has three services: `redis` (append-only, healthcheck), `api`, and `worker`. Both `api` and `worker` share the bind-mounted `./data` volume so the worker's output is immediately visible to the API.
+
+`ANALYSIS_QUEUE_MODE=redis` is the default. `ANALYSIS_QUEUE_MODE=inline` runs the job inside the request process for tests and local debugging without Redis.
+
+Dependencies added to `requirements.txt`: `rq==3.0.0`, `redis==8.1.0`, `croniter==7.0.0` (RQ dependency), `h5netcdf==1.8.3`, `h5py==3.16.0`.
+
+### Job lifecycle
+
+New endpoints (`app/api/routes/comparison.py`):
+
+- `POST /api/v1/analysis/trend` → `202` with `job_id`, `status_url`, `result_url`
+- `POST /api/v1/analysis/compare/variables` → `202` with `job_id`, `status_url`, `result_url`
+- `POST /api/v1/analysis/compare/regions` → same envelope
+- `GET /api/v1/analysis/jobs/{job_id}` → status/progress
+- `GET /api/v1/analysis/jobs/{job_id}/result` → final result (embedded, not just a URL)
+
+State is written as JSON under `data/jobs/{job_id}/`:
+
+- `status.json`: `queued` → `started` (with `stage`, `label`, `current`, `total`, `percent`) → `finished` / `failed`
+- `result.json`: the full response payload, written once on success
+- Intermediate per-variable/per-region artifacts live beside them
+
+The API and worker share these files (`app/jobs/store.py`); Redis only carries the queue entry. `prune_old_jobs()` exists but is not scheduled yet.
+
+### Trend endpoint moved to the queue
+
+The legacy `POST /analysis/trend` route used to run the entire acquisition and analysis inside the HTTP request. It now validates the request, enqueues a `trend_analysis` job, and returns `202` with the same envelope as the comparison endpoints.
+
+- The route keeps its Pydantic contract, adds the `2000-02-24` coverage floor and a `366 * 30` day cap, and returns `400` before enqueueing when validation fails.
+- The collection/statistics code moved from `app/api/routes/analysis.py` into `app/services/trend_service.py`, which the worker calls via `app.jobs.tasks.run_job`.
+- Artifacts go to `data/jobs/{job_id}/trend/`, and `region_name` is `trend_{job_id}`, so concurrent jobs no longer overwrite the same CSV/JSON.
+- The result includes `metadata.output_files` and the same base64 charts as before.
+- Worker failures store `status_code` and `error_detail`. `GET /jobs/{job_id}/result` replays that status: a missing GDAL still returns `503`, an empty series still returns `404`, and a timeout still returns `504`.
+- `ANALYSIS_QUEUE_MODE=inline` runs the job in-process for tests; failures are recorded in the job files rather than raised from the submit call, so the `202` + result-fetch flow is identical to Redis mode.
+
+### Variable adapters
+
+`app/services/variables/` defines a small registry and one collector per variable:
+
+| Variable | Dataset | Source frequency |
+| --- | --- | --- |
+| `land_surface_temperature` | MOD11A1 | daily |
+| `ndvi` | MOD13Q1 | 16-day |
+| `precipitation` | GPM_3IMERGD | daily |
+| `soil_moisture` | SPL3SMP_E | daily |
+| `air_temperature` | M2SDNXSLV | daily |
+
+`extract_subdataset_to_tiff` in `modis_processor.py` now takes a `grid_name` so the NDVI collector can reuse the HDF4 extraction path with `MODIS_Grid_16DAY_250m_500m_VI`.
+
+GPM, SMAP and MERRA-2 granules are global. `remote_grid.py` opens them with `earthaccess.open()` and subsets the AOI in xarray rather than downloading whole files. These collectors use one temporal-range search per chunk grouped by granule date, unlike the legacy per-day MOD11A1 loop.
+
+### Daily NDVI caveat
+
+NDVI has no daily native product at this level. MOD13Q1 is 16-day. To keep every variable on the same daily response frequency, each composite value is carried forward across its own 16-day window. The record is explicit about this:
+
+- `source_frequency: "16-day"`
+- `coverage_status: "period_value"`
+
+Days outside the window of the latest available composite are missing, not interpolated. This is a period value, not a synthetic daily observation.
+
+### Chunking and guards
+
+- `MAX_DAYS_PER_DAILY_JOB` (default `1826`, ~5 years): longer ranges are collected in chunks and merged by `observation_date` before analysis.
+- `MAX_TOTAL_DAYS = 366 * 30`: hard request cap.
+- `MAX_REGIONS = 8`.
+- `start_date >= 2000-02-24` (MOD11A1 v061 coverage start).
+- Unsupported variables/methods, duplicate AOIs, and invalid AOIs return `400`.
+
+A failed variable or region is recorded with `status: "failed"` and an `error`; the rest of the job continues.
+
+### Shared analysis engine and charts
+
+`app/services/analysis_engine.py` is now the single dispatch for the trend route and comparison jobs. It accepts generic `value` records (falling back to `mean_lst`/`mean_temperature_celsius`) and renders per-method base64 PNGs.
+
+`app/services/comparison_charts.py` adds comparison-level charts:
+
+- `timeseries_comparison`: one subplot per variable/region (units differ per subplot)
+- `trend_summary`: linear-regression slopes
+- `coverage_comparison`: data coverage percentages
+
+All charts are `{"content_type": "image/png", "base64": "..."}` using `app/utils/encoding.py`.
+
+### Verification
+
+- `pytest tests -m "not integration"`: 79 passed, 2 failed, 3 deselected.
+- Both failures are artifact-only (`test_final_egypt_raster_is_wgs84_and_cropped_to_aoi`, `test_report_contains_required_scientific_summary_fields`) because `data/processed/egypt/*` does not exist in this checkout.
+- `docker compose config --quiet` passes.
+- Live Earthdata runs and the worker inside the container were **not** verified here; Earthdata credentials and remote access are required.
+- Actual NDVI/GPM/SMAP/MERRA-2 variable names and QA fields are based on product documentation, not validated against downloaded granules.
+
+---
+
 ## Known follow-ups from this work
 
-- **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. The API now returns `503` with that guidance instead of `404` "no valid observations".
+- **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".
+- Comparison jobs still need a live run to confirm the GPM/SMAP/MERRA-2 variable names, QA fields, and remote-open behavior.
+- `prune_old_jobs()` is not scheduled; job artifacts accumulate under `data/jobs/`.
+- Live runs of the trend job through Redis are unverified; the unit suite exercises it with `ANALYSIS_QUEUE_MODE=inline`.
+- Trend jobs are still sequential: one Earthdata search per calendar day, no chunking (comparison jobs do chunk at `MAX_DAYS_PER_DAILY_JOB`).
 - The two artifact-dependent tests should move under the `integration` marker (or skip when the files are absent).
 - The sibling `EALive/` tree is a separate codebase from another machine; ignore it rather than keeping it in sync.
 - The unversioned `/health` alias was removed by the `app/main.py` rewrite; decide whether to restore it for external probes or keep only `/api/v1/health/`.
-- The P0–P3 roadmap in `README.md` is unchanged: unify orchestration, preserve missing periods, fix artifact collisions, then async jobs and guards.

@@ -101,12 +101,17 @@ def find_gdal_translate() -> str:
     return candidate
 
 
-def extract_subdataset_to_tiff(hdf_path: str | Path, subdataset_name: str, output_tif: str | Path) -> Path:
+def extract_subdataset_to_tiff(
+    hdf_path: str | Path,
+    subdataset_name: str,
+    output_tif: str | Path,
+    grid_name: str = "MODIS_Grid_Daily_1km_LST",
+) -> Path:
     gdal_translate = find_gdal_translate()
     hdf_path = str(hdf_path)
     output_tif = Path(output_tif)
     output_tif.parent.mkdir(parents=True, exist_ok=True)
-    gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":MODIS_Grid_Daily_1km_LST:{subdataset_name}'
+    gdal_uri = f'HDF4_EOS:EOS_GRID:"{hdf_path}":{grid_name}:{subdataset_name}'
     subprocess.run(
         [
             gdal_translate,

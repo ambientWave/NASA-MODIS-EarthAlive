@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: earth-alive-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -17,14 +30,19 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       # Docker Desktop bind mounts do not emit inotify events on Windows/macOS.
-      WATCHFILES_FORCE_POLLING: "true"
+      WATCHFILES_FOR_POLLING: "true"
       # conda-forge GDAL with the HDF4 plugin, installed in the image.
       GDAL_TRANSLATE: "/opt/gdal/bin/gdal_translate"
+      ANALYSIS_QUEUE_MODE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
     volumes:
       # Live source for uvicorn --reload.
       - ./app:/srv/backend/backend/app
       # Downloaded granules and processed artifacts, shared with the host.
       - ./data:/srv/backend/data
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health/"]
       interval: 30s
@@ -33,3 +51,30 @@ services:
       start_period: 20s
     init: true
     restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: earth-alive-api:dev
+    container_name: earth-alive-worker
+    command: ["rq", "worker", "--url", "redis://redis:6379/0", "analysis"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PYTHONUNBUFFERED: "1"
+      GDAL_TRANSLATE: "/opt/gdal/bin/gdal_translate"
+      ANALYSIS_QUEUE_MODE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
+    volumes:
+      - ./app:/srv/backend/backend/app
+      - ./data:/srv/backend/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+volumes:
+  redis-data:

@@ -172,7 +172,11 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/api/v1/health/` | Health check |
 | GET | `/api/v1/variables/` | List supported environmental variables (static metadata) |
 | GET | `/api/v1/variables/{variable_id}` | Single variable metadata |
-| POST | `/api/v1/analysis/trend` | Run MODIS LST acquisition + trend analysis |
+| POST | `/api/v1/analysis/trend` | Queue a MODIS LST acquisition + trend analysis job |
+| POST | `/api/v1/analysis/compare/variables` | Queue a background multi-variable comparison job |
+| POST | `/api/v1/analysis/compare/regions` | Queue a background multi-region comparison job |
+| GET | `/api/v1/analysis/jobs/{job_id}` | Job status and progress |
+| GET | `/api/v1/analysis/jobs/{job_id}/result` | Job result, including base64 charts |
 | GET | `/api/v1/analysis/health` | Analysis service liveness |
 
 
@@ -193,21 +197,118 @@ Request body:
 
 - `temporal_resolution`: `daily` | `monthly` | `yearly`
 - `analysis_methods`: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`
+- `start_date` must be on or after `2000-02-24`; the range is capped at `366 * 30` days.
 
-Response envelope:
+The route validates the request and enqueues a `trend_analysis` job, returning `202`:
+
+```json
+{
+  "job_id": "9c0f...",
+  "status": "queued",
+  "status_url": "/api/v1/analysis/jobs/9c0f...",
+  "result_url": "/api/v1/analysis/jobs/9c0f.../result"
+}
+```
+
+Poll `status_url`, then fetch the result envelope from `result_url`:
 
 ```json
 {
   "success": true,
-  "metadata": { "product": "...", "temporal_resolution": "...", "start_date": "...", "end_date": "...", "aoi": {} },
+  "job_id": "9c0f...",
+  "metadata": { "mode": "trend_analysis", "product": "...", "temporal_resolution": "...", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
   "data_quality": { "observation_count": 12, "valid_observation_count": 12, "missing_observation_percentage": 0.0, "data_coverage_percentage": 98.3, "warnings": [] },
   "analysis_results": { "linear_regression": {}, "mann_kendall": {} },
-  "visualizations": {},
+  "visualizations": {
+    "heatmap": { "content_type": "image/png", "base64": "iVBORw0..." },
+    "linear_regression": { "content_type": "image/png", "base64": "iVBORw0..." }
+  },
   "warnings": []
 }
 ```
 
-Status codes: `400` invalid input, `404` no data / insufficient observations, `503` Earthdata connection failure, `504` processing timeout, `500` unexpected error.
+Charts are returned inline as base64 PNG objects keyed by figure or method name (`heatmap`, `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`). No file paths are returned.
+
+Submit-time codes: `400` invalid input, `503` queue unavailable. Worker failures keep their original meaning when the result is fetched: `404` no data / insufficient observations, `503` Earthdata or GDAL configuration failure, `504` processing timeout, `500` unexpected error. The status document records `status_code` and `error_detail`.
+
+### Analysis jobs (background)
+
+All three analysis endpoints (`/trend`, `/compare/variables`, `/compare/regions`) answer `202 Accepted` immediately instead of blocking the request:
+
+```json
+{
+  "job_id": "9c0f...",
+  "status": "queued",
+  "status_url": "/api/v1/analysis/jobs/9c0f...",
+  "result_url": "/api/v1/analysis/jobs/9c0f.../result"
+}
+```
+
+Work runs in an RQ worker backed by Redis (`ANALYSIS_QUEUE_MODE=redis`). Set `ANALYSIS_QUEUE_MODE=inline` to execute the job in-process for tests or local debugging without Redis. Job status and results are persisted as JSON under `data/jobs/{job_id}/`.
+
+Supported variables: `land_surface_temperature`, `ndvi`, `precipitation`, `soil_moisture`, `air_temperature`. Supported methods: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`. Only `temporal_resolution: "daily"` is accepted.
+
+Shared guards:
+
+- `start_date` must be on or after `2000-02-24` (MOD11A1 v061 coverage start).
+- The range is capped at `366 * 30` days.
+- Date ranges longer than `MAX_DAYS_PER_DAILY_JOB` (default `1826`, roughly five years) are collected in chunks and merged by observation date before analysis.
+- `POST /compare/regions` accepts at most 8 regions and rejects duplicate bounding boxes.
+
+#### `POST /api/v1/analysis/compare/variables`
+
+```json
+{
+  "aoi": { "west": 31.0, "south": 29.0, "east": 32.0, "north": 30.0 },
+  "start_date": "2024-01-01",
+  "end_date": "2024-01-31",
+  "temporal_resolution": "daily",
+  "variables": ["land_surface_temperature", "ndvi", "precipitation"],
+  "analysis_methods": ["linear_regression", "mann_kendall", "t_test"],
+  "include_visualizations": true
+}
+```
+
+The result embeds one entry per variable under `variables`, each with `metadata`, `series`, `data_quality`, `analysis_results`, per-method `visualizations`, `status`, and `warnings`. A variable that fails is marked `status: "failed"` with an `error` and does not abort the rest of the job.
+
+#### `POST /api/v1/analysis/compare/regions`
+
+```json
+{
+  "variable": "land_surface_temperature",
+  "regions": [
+    { "west": 31.0, "south": 29.0, "east": 31.5, "north": 29.5 },
+    { "west": 31.5, "south": 29.0, "east": 32.0, "north": 29.5 }
+  ],
+  "start_date": "2024-01-01",
+  "end_date": "2024-01-31",
+  "temporal_resolution": "daily",
+  "analysis_methods": ["linear_regression", "mann_kendall"],
+  "include_visualizations": true
+}
+```
+
+The result embeds one entry per region under `regions` (keys `region_1`, `region_2`, ...), each with the same per-variable shape plus its `aoi`. Comparison-level charts are under `comparison.visualizations`: `timeseries_comparison`, `trend_summary`, and `coverage_comparison`, all base64 PNG objects.
+
+#### `GET /api/v1/analysis/jobs/{job_id}`
+
+Returns the persisted status: `queued`, `started`, `finished`, or `failed`, along with `stage`, `label`, `current`, `total`, `percent`, and timestamps. Custom job ids are also RQ job ids, so `rq_status` is included while the job runs.
+
+#### `GET /api/v1/analysis/jobs/{job_id}/result`
+
+Returns the stored result once the job finishes. `409` means still running or already failed; `404` means the job is unknown or no result was written.
+
+#### Variable adapters
+
+| Variable | Dataset | Native frequency | Notes |
+| --- | --- | --- | --- |
+| `land_surface_temperature` | MOD11A1 | daily | Existing MODIS pipeline; QA mask and Kelvin→Celsius |
+| `ndvi` | MOD13Q1 | 16-day | Each composite is carried forward across its 16-day window to produce daily rows |
+| `precipitation` | GPM_3IMERGD | daily | Remote `earthaccess.open()` + xarray AOI subset |
+| `soil_moisture` | SPL3SMP_E | daily | Remote subset with retrieval-quality filtering |
+| `air_temperature` | M2SDNXSLV | daily | Kelvin→Celsius |
+
+NDVI daily rows are **period values**, not interpolated observations. Each record declares `source_frequency: "16-day"` and `coverage_status: "period_value"`; days beyond the 16-day window of the last available composite are explicit missing observations.
 
 ---
 
@@ -218,14 +319,18 @@ The codebase is a two-layer design:
 1. **API layer** (`app/api/routes/*`) owns HTTP concerns: Pydantic request models, validation, exception-to-status translation, and the response envelope.
 2. **Service layer** (`app/services/*`) owns everything else: remote data acquisition, raster processing, aggregation, persistence, and statistics. Services operate on plain dictionaries and module-level functions.
 
-There is no dependency-injection container, no repository/database layer, and no persistent job store. State lives in the filesystem under `data/` and in an in-memory granule cache file.
+There is no dependency-injection container and no relational database. State lives in the filesystem under `data/` and in an in-memory granule cache file. Analysis jobs add Redis/RQ as a queue, but job status and results are still plain JSON files under `data/jobs/{job_id}/`, written by whichever process ran the job.
 
 Flow at a glance:
 
 ```
-HTTP request
+HTTP POST /analysis/trend
    → Pydantic validation (422)
    → route-level validation (400)
+   → create_job("trend_analysis") → write status.json
+   → enqueue on Redis (RQ) and return 202
+
+RQ worker
    → TimeSeriesConfig (dataclass validation)
    → collect_mod11a1_timeseries
         → earthaccess search (per day)
@@ -234,37 +339,41 @@ HTTP request
         → gdal_translate ×2 per granule
         → QA mask → Kelvin→Celsius → reproject → mosaic → summarize
         → aggregate to daily/monthly/yearly
-        → write CSV + JSON to data/processed/time_series/
+        → write CSV + JSON under data/jobs/{job_id}/trend/time_series/
    → _as_stats_records (schema translation)
    → validate_time_series (pandas)
    → method dispatch (linear, MK, modified MK, seasonal MK, t-test)
-   → response envelope
+   → write result.json and mark status finished
 ```
 
 ---
 
 ## Workflows
 
-### 1. Live analysis path (`POST /api/v1/analysis/trend`)
+### 1. Trend job (`POST /api/v1/analysis/trend`)
 
-This is the only production path.
+All analysis work is asynchronous.
 
 1. Pydantic validates `TrendAnalysisRequest` (literal enums, coordinate ranges) → 422 on malformed input.
-2. The handler re-validates the same constraints manually → 400 (`app/api/routes/analysis.py:181-215`). Most of this is unreachable because the `Literal`/`Field` constraints already reject the values.
-3. `TimeSeriesConfig` validates again (AOI ordering, product whitelist, aggregation) in `app/services/modis_timeseries.py:60-81`.
-4. `collect_mod11a1_timeseries` runs the acquisition loop described above. **One Earthdata search per calendar day**, plus downloads and two `gdal_translate` subprocesses per granule.
-5. `_as_stats_records` (`analysis.py:88`) translates between two record vocabularies (see [Data schemas](#data-schemas)).
+2. The handler re-validates the same constraints manually, plus the coverage start and maximum range → 400.
+3. `create_job` writes `data/jobs/{job_id}/status.json` and enqueues `app.jobs.tasks.run_job` on the `analysis` RQ queue → `202` with `job_id`, `status_url`, `result_url`.
+4. The worker calls `execute_trend_analysis` (`app/services/trend_service.py`), which builds `TimeSeriesConfig` (AOI ordering, product whitelist, aggregation) and runs the acquisition loop. **One Earthdata search per calendar day**, plus downloads and two `gdal_translate` subprocesses per granule.
+5. `_as_stats_records` (`trend_service.py`) translates between the collector and statistics vocabularies (see [Data schemas](#data-schemas)).
 6. `validate_time_series` parses dates, rejects duplicates, separates missing observations, and computes coverage warnings.
-7. Requested methods are dispatched inline (`analysis.py:261-289`).
-8. Warnings are de-duplicated and returned alongside `metadata` and `data_quality`.
+7. Requested methods are dispatched inline in the worker.
+8. Base64 charts are generated, the result is written to `result.json`, and the status becomes `finished`. Failures store `status_code` and `error_detail`; the result endpoint replays the original HTTP status.
 
-### 2. Full statistics orchestrator (not wired to the API)
+### 2. Comparison jobs (`/compare/variables`, `/compare/regions`)
+
+Same job lifecycle, but `execute_variable_comparison` / `execute_region_comparison` (`app/services/comparison_service.py`) run the variable adapters in `app/services/variables/`. Long date ranges are chunked at `MAX_DAYS_PER_DAILY_JOB`, merged by observation date, then analyzed through the shared `app/services/analysis_engine.py`.
+
+### 3. Full statistics orchestrator (not wired to the API)
 
 `analyze_time_series` in `app/services/statistical_analysis.py:702-818` is the *complete* orchestration: standard and modified MK, seasonal MK, OLS, HAC/Newey-West, optional Welch comparison, automatic method selection, scientific limitations, chart generation, and JSON persistence.
 
-The API route **does not call it**. It reimplements a smaller, divergent subset inline. Net effect: any method added to one path silently does not appear in the other, and `visualizations` is always `{}` in the API even though the chart generator exists.
+The API routes **do not call it**. The trend job keeps a smaller inline dispatch (`trend_service.py`), while comparison jobs use the shared `analysis_engine.py`. `visualizations` is populated with base64 PNG charts on every analysis path.
 
-### 3. Offline / CLI pipelines
+### 4. Offline / CLI pipelines
 
 - `run_modis_egypt_pipeline` (`app/services/modis_processor.py:170`) is a standalone CLI/`__main__` pipeline for the Egypt bounding box.
 - `python -m app.services.raster_processor` inspects an LST/QC GeoTIFF pair and renders a heatmap. All paths are arguments, and defaults are project-rooted under `data/processed`:
@@ -281,7 +390,7 @@ python -m app.services.raster_processor --lst path/to/LST.tif --qc path/to/QC.ti
 
 The same raster loop therefore exists in three places: `run_modis_egypt_pipeline`, `process_aoi_for_date`, and the test helper. Only `process_aoi_for_date` is used by the API.
 
-### 4. Test workflow
+### 5. Test workflow
 
 - Unit tests exercise pure helpers and services with `tmp_path`.
 - `pytest.ini` registers the `integration` marker, but it is not in `addopts`, so integration tests still run by default. Use `-m "not integration"` to skip live NASA downloads.
@@ -391,6 +500,7 @@ Regions are plain bounding-box dictionaries `{west, south, east, north}`. Use th
 | `data/processed/time_series/` | Time-series CSV + JSON outputs |
 | `data/processed/egypt/` | Egypt CLI raster, heatmap, report |
 | `data/processed/analysis/` | Default analysis output directory |
+| `data/jobs/{job_id}/` | Comparison job status, intermediate artifacts, and `result.json` |
 | `data/cache/modis_granule_cache.json` | Granule download cache (filename → local path) |
 | `data/processed/global_tests/` | Integration-test outputs, per region |
 
@@ -416,9 +526,12 @@ Coverage map:
 | `test_modis_timeseries.py` | Date ranges, missing records, pixel summaries, granule cache, monthly aggregation, CSV/JSON output |
 | `test_modis_validation.py` | QA bit masking, LST validity, Kelvin conversion, artifact CRS/bounds, report fields |
 | `test_global_aoi.py` | Dynamic AOI definitions and multi-region pipeline behavior |
-| `test_api_analysis.py` | Health endpoint, trend endpoint contract, invalid AOI/date rejection |
+| `test_api_analysis.py` | Health endpoint, trend job submission, inline job status/result, worker error replay, invalid AOI/date/range rejection |
+| `test_comparison.py` | Variable registry, generic stats adapter, base64 charts, date chunking, variable/region execution |
+| `test_api_comparison.py` | Comparison job submission, validation guards (variables, dates, duplicate AOIs), status/result routes |
+| `test_encoding.py` | Base64 helper round-trips for bytes and files |
 
-Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` edge cases, concurrent request behavior, and the full orchestrator's output shape.
+Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` edge cases, concurrent request behavior, the full orchestrator's output shape, and live Earthdata checks for the comparison variable adapters.
 
 ---
 
@@ -433,23 +546,22 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 | 3 | When a date has no valid pixels, the detailed `obs_record` (including its warnings) is discarded and a generic missing record is appended. | `modis_timeseries.py:394-400` |
 | 4 | Overlapping tiles are merged last-wins instead of averaged, producing seams at tile boundaries. | `modis_timeseries.py:260` |
 | 5 | `kendall_tau` uses the tie-free (tau-a) denominator even though the tie correction is computed for the variance. | `statistical_analysis.py:118-120` |
-| 6 | Output filenames are fixed to `region_name="trend_api"`; every AOI and concurrent request overwrites the same CSV/JSON. | `modis_timeseries.py:319-320` |
-| 7 | Service returns `output_files`, but the route discards them; `visualizations` is always `{}`. | `analysis.py:302` |
-| 8 | `int(record.get("valid_pixels", ...))` raises when the key exists with `None`. | `analysis.py:108` |
-| 9 | Manual validation duplicates Pydantic constraints and is largely unreachable. | `analysis.py:192-215` |
-| 10 | Response models are `dict[str, Any]`, so OpenAPI documents no result contract. | `analysis.py:69-75` |
+| 6 | Resolved for trend jobs: `region_name` is now `trend_{job_id}`, so artifacts no longer collide. The helper's default remains `trend_api`. | `trend_service.py` |
+| 7 | Resolved: trend results include `metadata.output_files`; comparison artifacts persist under `data/jobs/{job_id}/`. | `trend_service.py`, `comparison_service.py` |
+| 8 | Resolved in the trend worker: `int(record.get(...) or 0)` tolerates `None`. | `trend_service.py` |
+| 9 | Manual validation duplicates Pydantic constraints, though the coverage/range checks add real guards. | `analysis.py` |
+| 10 | Result payloads are still `dict[str, Any]`; only the `202` job envelope is typed, so OpenAPI documents no full result contract. | `analysis.py` |
 
 ### Scale and robustness
 
 | # | Issue | Impact |
 | --- | --- | --- |
-| 1 | A one-year monthly request performs ~365 sequential Earthdata searches + downloads + GDAL subprocesses **inside one HTTP request**. | Minutes to hours per call; exhausts the threadpool. |
-| 2 | No maximum date range. | Trivial denial of service. |
-| 3 | No maximum AOI size. A near-global bbox at 0.01° allocates ~2.5 GB per array, multiplied by mosaic copies. | Out-of-memory. |
-| 4 | `TimeoutError` maps to 504 but nothing ever raises it. | Dead error path. |
-| 5 | Granule cache rewrites the entire JSON per granule with no locking. | Corruption under concurrency. |
-| 6 | Intermediate per-granule TIFs are never cleaned; cache has no TTL or size limit. | Unbounded disk growth. |
-| 7 | No logging, request IDs, or job visibility. | Long runs are opaque. |
+| 1 | A one-year monthly request performs ~365 sequential Earthdata searches + downloads + GDAL subprocesses. It now runs in the worker instead of the HTTP request, but is still sequential. | Minutes to hours per job; one worker blocked. |
+| 2 | AOI size is not capped. The trend and comparison routes cap the date range at 30 years. | Out-of-memory for a near-global bbox. |
+| 3 | `TimeoutError` maps to 504 but nothing ever raises it. | Dead error path. |
+| 4 | Granule cache rewrites the entire JSON per granule with no locking. | Corruption under concurrency. |
+| 5 | Intermediate per-granule TIFs are never cleaned; cache has no TTL or size limit. | Unbounded disk growth. |
+| 6 | No request IDs. Job status exists, but nothing schedules `prune_old_jobs()` for `data/jobs/`. | Stale job artifacts accumulate. |
 
 ### Hygiene
 
@@ -486,11 +598,13 @@ Missing coverage: route-level error mapping (503/504/404), `_as_stats_records` e
 
 ### P2 — Make long runs asynchronous
 
-1. `POST /api/v1/analysis/jobs` → `{job_id}`; `GET /api/v1/analysis/jobs/{job_id}` → status/progress/result.
-2. Run collection in a bounded executor (or a task queue such as Celery/RQ if concurrency grows).
-3. Add `max_range_days` and `max_grid_pixels` guards.
-4. Persist job state and artifacts under a per-job directory.
-5. Replace the per-day search loop with one temporal-range query grouped by date (365 metadata round-trips → 1).
+Implemented for all three analysis endpoints (`POST /analysis/trend`, `POST /compare/variables`, `POST /compare/regions`, plus `GET /jobs/{job_id}` and `/result`), using Redis + RQ.
+
+1. ~~`POST /api/v1/analysis/jobs` → `{job_id}`; `GET /api/v1/analysis/jobs/{job_id}` → status/progress/result.~~ (all analysis jobs)
+2. ~~Run collection in a bounded executor (or a task queue such as Celery/RQ if concurrency grows).~~ RQ worker added
+3. Add `max_range_days` and `max_grid_pixels` guards. — date range and region count guarded; AOI pixel cap still missing
+4. ~~Persist job state and artifacts under a per-job directory.~~ `data/jobs/{job_id}/`
+5. Replace the per-day search loop with one temporal-range query grouped by date (365 metadata round-trips → 1). — done for the new variable adapters; MOD11A1 still searches per day
 
 ### P3 — Infrastructure and operations
 
