@@ -371,13 +371,40 @@ def save_timeseries_outputs(records: list[dict[str, Any]], output_dir: str | Pat
 
 def parse_appeears_filename_date(filename: str) -> str | None:
     """Extract YYYY-MM-DD date from AppEEARS output bundle filename."""
-    doy_match = re.search(r"doy(\d{4})(\d{3})", filename, re.IGNORECASE)
+    base_name = Path(filename).name
+
+    # 1. ISO datetime format e.g. _20240101T000000_ or _2024-01-01T...
+    iso_match = re.search(r"[_-](\d{4})[-_]?(\d{2})[-_]?(\d{2})T", base_name)
+    if iso_match:
+        y, m, d = iso_match.groups()
+        try:
+            return datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 2. DOY format with explicit 'doy' prefix e.g. doy2024001
+    doy_match = re.search(r"doy(\d{4})(\d{3})", base_name, re.IGNORECASE)
     if doy_match:
         year = int(doy_match.group(1))
         doy = int(doy_match.group(2))
-        return (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y-%m-%d")
+        try:
+            return (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
 
-    cal_match = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", filename)
+    # 3. DOY format with 7 digits bordered by delimiters e.g. _2024001_ or .2024001.
+    doy_raw_match = re.search(r"[._-](\d{4})(\d{3})[._-]", base_name)
+    if doy_raw_match:
+        year = int(doy_raw_match.group(1))
+        doy = int(doy_raw_match.group(2))
+        if 1 <= doy <= 366 and 1980 <= year <= 2100:
+            try:
+                return (datetime(year, 1, 1) + timedelta(days=doy - 1)).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+    # 4. Standard calendar YYYYMMDD or YYYY-MM-DD
+    cal_match = re.search(r"(?:^|[._-])(\d{4})[-_]?(\d{2})[-_]?(\d{2})(?:[._-]|$)", base_name)
     if cal_match:
         y, m, d = cal_match.groups()
         try:
@@ -385,6 +412,7 @@ def parse_appeears_filename_date(filename: str) -> str | None:
             return dt.strftime("%Y-%m-%d")
         except ValueError:
             pass
+
     return None
 
 
@@ -418,16 +446,20 @@ def collect_mod11a1_timeseries_appeears(config: TimeSeriesConfig) -> dict[str, A
         projection="geographic",
     )
 
-    client.wait_for_task(
-        task_id=task_id,
-        should_cancel=config.should_cancel,
-    )
+    try:
+        client.wait_for_task(
+            task_id=task_id,
+            should_cancel=config.should_cancel,
+        )
 
-    downloaded = client.download_bundle(
-        task_id=task_id,
-        target_dir=raw_dir,
-        file_patterns=(".tif",),
-    )
+        downloaded = client.download_bundle(
+            task_id=task_id,
+            target_dir=raw_dir,
+            file_patterns=(".tif",),
+        )
+    finally:
+        # Clean up cloud task on AppEEARS account to free resources
+        client.delete_task(task_id)
 
     files_by_date: dict[str, dict[str, Path]] = {}
     for p in downloaded:

@@ -7,6 +7,7 @@ subsetting, layer extraction, mosaicing, and reprojection to EPSG:4326.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from datetime import datetime
@@ -257,11 +258,16 @@ class AppEEARSClient:
         self,
         task_id: str,
         poll_interval_seconds: int = 15,
-        timeout_seconds: int = 1800,
+        timeout_seconds: int = 18000,
         should_cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[int, str], None] | None = None,
     ) -> dict[str, Any]:
-        """Poll AppEEARS until the task reaches 'done' or 'error' state."""
+        """Poll AppEEARS until the task reaches 'done' or 'error' state.
+
+        Extracts multi-step progress from progress.details (Initializing ->
+        Downloading -> Subsetting -> Generating Files -> Extracting Stats ->
+        Finalizing) and verifies completion against the task object.
+        """
         start_time = time.time()
         log(f"appeears: waiting for task {task_id} to complete (timeout: {timeout_seconds}s)...")
 
@@ -271,18 +277,47 @@ class AppEEARSClient:
                 self.delete_task(task_id)
                 raise RuntimeError(f"Task {task_id} canceled.")
 
+            status_info: dict[str, Any] = {}
             try:
                 status_info = self.get_task_status(task_id)
             except Exception as exc:
                 log(f"appeears: transient status error for {task_id}: {exc}")
-                status_info = {}
 
-            status = status_info.get("status")
-            progress_summary = status_info.get("progress", {}).get("summary", 0)
+            # Extract detailed step progress (Initializing, Downloading, Subsetting, Generating Files, Finalizing)
+            progress_obj = status_info.get("progress", {}) if isinstance(status_info, dict) else {}
+            progress_summary = int(progress_obj.get("summary") or 0)
+            details = progress_obj.get("details", [])
+            active_step_desc = None
+            if isinstance(details, list):
+                for step_item in details:
+                    if int(step_item.get("pct_complete", 0)) < 100:
+                        active_step_desc = step_item.get("desc")
+                        break
+                if not active_step_desc and details:
+                    active_step_desc = details[-1].get("desc")
 
+            status = status_info.get("status") if isinstance(status_info, dict) else None
+            if not status and status_info.get("status_type") == "task":
+                status = "processing"
+
+            # Check task details when summary reaches 100% or to confirm status
+            if status != "done" and (progress_summary >= 100 or not status):
+                try:
+                    task_details = self.get_task_details(task_id)
+                    status = task_details.get("status") or status
+                    summary_obj = task_details.get("summary", {})
+                    if summary_obj.get("empty") is True:
+                        desc = summary_obj.get("description", "No matching source granules found for the request.")
+                        log(f"appeears: task {task_id} finished with empty summary: {desc}")
+                        raise ValueError(f"No NASA data available: {desc}")
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+
+            step_label = active_step_desc or status or "processing"
             if on_progress:
-                msg = f"AppEEARS {status or 'pending'} ({progress_summary}%)"
-                on_progress(progress_summary, msg)
+                on_progress(progress_summary, f"AppEEARS: {step_label} ({progress_summary}%)")
 
             if status == "done":
                 log(f"appeears: task {task_id} is done.")
@@ -340,7 +375,9 @@ class AppEEARSClient:
                 if not any(pattern.lower() in file_name.lower() for pattern in file_patterns):
                     continue
 
-            local_path = dest_dir / file_name
+            clean_rel = file_name.lstrip("/\\").replace("\\", "/")
+            local_path = dest_dir / clean_rel
+            local_path.parent.mkdir(parents=True, exist_ok=True)
             if skip_existing and local_path.is_file():
                 if file_size > 0 and local_path.stat().st_size == file_size:
                     log(f"appeears: skipping existing file {file_name}")
@@ -357,6 +394,15 @@ class AppEEARSClient:
                     for chunk in stream_resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
+
+            expected_sha256 = item.get("sha256")
+            if expected_sha256:
+                hasher = hashlib.sha256()
+                with open(local_path, "rb") as f:
+                    while c := f.read(65536):
+                        hasher.update(c)
+                if hasher.hexdigest().lower() != expected_sha256.lower():
+                    log(f"appeears: warning: sha256 mismatch for {file_name}")
 
             downloaded_paths.append(local_path)
 

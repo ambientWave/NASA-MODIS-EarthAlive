@@ -215,6 +215,14 @@ def collect_daily_grid(
                 request.aoi["north"],
             ),
         )
+        if not granules:
+            # Global products (GPM IMERG, MERRA-2) may not index spatial bounds in CMR; retry globally
+            granules = earthaccess.search_data(
+                short_name=short_name,
+                version=version,
+                count=-1,
+                temporal=(chunk_start, chunk_end),
+            )
         grouped: dict[str, list[Any]] = {}
         for granule in granules:
             granule_day = granule_date(granule)

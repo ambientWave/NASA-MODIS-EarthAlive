@@ -393,15 +393,17 @@ def collect_ndvi_appeears(request: CollectionRequest) -> VariableSeries:
     )
 
     request.check_cancel()
-    client.wait_for_task(
-        task_id=task_id,
-        should_cancel=request.should_cancel,
-        on_progress=lambda pct, msg: request.report(pct, 100, detail=msg),
-    )
-
     out_dir = Path(request.output_dir or _cache_root()) / "raw_appeears"
     out_dir.mkdir(parents=True, exist_ok=True)
-    downloaded = client.download_bundle(task_id, target_dir=out_dir, file_patterns=(".tif",))
+    try:
+        client.wait_for_task(
+            task_id=task_id,
+            should_cancel=request.should_cancel,
+            on_progress=lambda pct, msg: request.report(pct, 100, detail=msg),
+        )
+        downloaded = client.download_bundle(task_id, target_dir=out_dir, file_patterns=(".tif",))
+    finally:
+        client.delete_task(task_id)
 
     files_by_date: dict[str, dict[str, Path]] = {}
     for p in downloaded:

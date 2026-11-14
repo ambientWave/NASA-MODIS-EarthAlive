@@ -30,6 +30,8 @@ class Settings:
     appeears_base_url: str = "https://appeears.earthdatacloud.nasa.gov/api"
     modis_provider: str = "appeears"
     ndvi_provider: str = "appeears"
+    precipitation_provider: str = "appeears"
+    soil_moisture_provider: str = "appeears"
 
     @property
     def has_username_password(self) -> bool:
@@ -70,6 +72,8 @@ def get_settings() -> Settings:
     appeears_base_url = _clean(os.getenv("APPEEARS_BASE_URL")) or "https://appeears.earthdatacloud.nasa.gov/api"
     modis_provider = (_clean(os.getenv("MODIS_PROVIDER")) or "appeears").lower()
     ndvi_provider = (_clean(os.getenv("NDVI_PROVIDER")) or "appeears").lower()
+    precipitation_provider = (_clean(os.getenv("PRECIPITATION_PROVIDER")) or "appeears").lower()
+    soil_moisture_provider = (_clean(os.getenv("SOIL_MOISTURE_PROVIDER")) or "appeears").lower()
 
     settings = Settings(
         earthdata_username=username,
@@ -79,6 +83,8 @@ def get_settings() -> Settings:
         appeears_base_url=appeears_base_url,
         modis_provider=modis_provider,
         ndvi_provider=ndvi_provider,
+        precipitation_provider=precipitation_provider,
+        soil_moisture_provider=soil_moisture_provider,
     )
     settings.validate()
     return settings

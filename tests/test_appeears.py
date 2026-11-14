@@ -141,8 +141,8 @@ def test_appeears_download_bundle(client, tmp_path):
         "files": [
             {
                 "file_id": "f1",
-                "file_name": "MOD11A1_061_LST_Day_1km_doy2024001.tif",
-                "file_size": 12,
+                "file_name": "MOD11A1.061_2024001_to_2024031/MOD11A1.061_LST_Day_1km_20240101T000000_aid0001.tif",
+                "file_size": 14,
                 "file_type": "geotiff",
             },
             {
@@ -168,7 +168,8 @@ def test_appeears_download_bundle(client, tmp_path):
             )
 
             assert len(paths) == 1
-            assert paths[0].name == "MOD11A1_061_LST_Day_1km_doy2024001.tif"
+            assert paths[0].name == "MOD11A1.061_LST_Day_1km_20240101T000000_aid0001.tif"
+            assert paths[0].is_file()
             assert paths[0].read_bytes() == b"mock_tif_bytes"
 
 
@@ -176,6 +177,7 @@ def test_parse_appeears_filename_date():
     assert parse_appeears_filename_date("MOD11A1_061_LST_Day_1km_doy2024001_aid0001.tif") == "2024-01-01"
     assert parse_appeears_filename_date("MOD11A1_061_LST_Day_1km_doy2024032_aid0001.tif") == "2024-02-01"
     assert parse_appeears_filename_date("MOD11A1_061_LST_Day_1km_20240101T120000.tif") == "2024-01-01"
+    assert parse_appeears_filename_date("MOD11A1.061_2024001_to_2024031/MOD11A1.061_LST_Day_1km_20240101T000000_aid0001.tif") == "2024-01-01"
     assert parse_appeears_filename_date("MOD11A1_061_LST_Day_1km_2024-03-15.tif") == "2024-03-15"
     assert parse_appeears_filename_date("unknown_file.txt") is None
 
@@ -237,3 +239,45 @@ def test_ensure_appeears_auth(monkeypatch):
     with patch.object(client, "login", return_value="test-token"):
         tok = ensure_appeears_auth(client)
         assert tok == "test-token"
+
+
+def test_appeears_wait_for_task_extracts_step_progress(client):
+    client._token = "valid_token"
+    client._token_expires = 9999999999.0
+
+    in_progress_resp = MagicMock()
+    in_progress_resp.status_code = 200
+    in_progress_resp.json.return_value = [
+        {
+            "task_id": "test-uuid-step",
+            "status_type": "task",
+            "progress": {
+                "details": [
+                    {"step": 1, "desc": "Initializing", "pct_complete": 100},
+                    {"step": 2, "desc": "Downloading", "pct_complete": 45},
+                    {"step": 3, "desc": "Subsetting", "pct_complete": 0},
+                ],
+                "summary": 45,
+            },
+        }
+    ]
+
+    done_resp = MagicMock()
+    done_resp.status_code = 200
+    done_resp.json.return_value = {
+        "status": "done",
+        "task_id": "test-uuid-step",
+        "progress": {"summary": 100},
+    }
+
+    reported_messages = []
+
+    def on_prog(pct, msg):
+        reported_messages.append((pct, msg))
+
+    with patch.object(client.session, "request", side_effect=[in_progress_resp, done_resp]):
+        res = client.wait_for_task("test-uuid-step", poll_interval_seconds=0, on_progress=on_prog)
+        assert res["status"] == "done"
+        assert len(reported_messages) == 2
+        assert "Downloading (45%)" in reported_messages[0][1]
+

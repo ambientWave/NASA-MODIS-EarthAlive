@@ -7,11 +7,14 @@ also stores the original request, so one lookup answers "what was this job".
 
 from __future__ import annotations
 
-from typing import Any
+import base64
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.responses import JSONResponse
 
 from app.jobs import JobNotCancelable, cancel_job, get_job_result, get_job_status, list_jobs
+from app.services.pdf_report_service import build_analysis_pdf
 
 router = APIRouter(prefix="/analysis/jobs", tags=["Jobs"])
 
@@ -66,6 +69,58 @@ def job_result(job_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="Job has not finished yet.")
         raise HTTPException(status_code=404, detail=f"Result not found for job: {job_id}")
     return result
+
+
+@router.get(
+    "/{job_id}/pdf",
+    summary="Generate and stream a publication-quality PDF report for a finished analysis.",
+    responses={
+        200: {
+            "content": {
+                "application/pdf": {},
+                "application/json": {},
+            },
+            "description": "Returns raw PDF binary stream or JSON base64 envelope.",
+        },
+        404: {"description": "Job or result not found."},
+        409: {"description": "Job has not finished yet or was canceled."},
+    },
+)
+def job_pdf(
+    job_id: str,
+    download: bool = Query(
+        False,
+        description="If true, sets Content-Disposition to attachment to trigger direct browser file save.",
+    ),
+    format: Literal["binary", "base64"] = Query(
+        "binary",
+        description="'binary' streams raw application/pdf; 'base64' returns JSON envelope with base64 string.",
+    ),
+) -> Response:
+    result = job_result(job_id)
+    try:
+        pdf_bytes = build_analysis_pdf(result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF report: {exc}") from exc
+
+    if format == "base64":
+        return JSONResponse(
+            content={
+                "job_id": job_id,
+                "content_type": "application/pdf",
+                "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                "filename": f"analysis_{job_id}.pdf",
+            }
+        )
+
+    disposition_type = "attachment" if download else "inline"
+    filename = f"analysis_{job_id}.pdf"
+    headers = {
+        "Content-Disposition": f'{disposition_type}; filename="{filename}"',
+        "Content-Length": str(len(pdf_bytes)),
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
 
 
 @router.post(
