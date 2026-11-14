@@ -801,6 +801,31 @@ composite granularity.
 
 ---
 
+## 2026-11-14 - Flutter web build served by the API (`/home`)
+
+`app/main.py` now serves the checked-in Flutter web build:
+
+- `GET /home` returns `flutterweb/web/index.html` with
+  `Cache-Control: no-cache, must-revalidate`, so a new build is picked up
+  without a stale entrypoint.
+- `flutterweb/web/` is mounted at `/` with `StaticFiles(html=True)` and is
+  registered **after** every API router, so `/`, `/docs`, and `/api/v1/*` keep
+  working and the mount only handles the build's own paths
+  (`/main.dart.js`, `/assets/…`, `/canvaskit/…`, `/manifest.json`, …). This is
+  required because `index.html` declares `<base href="/">`.
+- The mount uses `check_dir=False` and `/home` returns `503` with a
+  `flutter build web` hint when the build directory is absent, so the API stays
+  importable in environments without the frontend.
+- The Docker image now copies `flutterweb/`, and the compose `api` service
+  bind-mounts `./flutterweb` read-only, so a rebuilt frontend is served without
+  an image rebuild.
+
+Verified with `tests/test_web_home.py`: `/home` is HTML containing the
+entrypoint, root-level assets return 200, `/` still returns the JSON banner and
+`/api/v1/health/` still works, and a missing build yields the 503 detail.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".

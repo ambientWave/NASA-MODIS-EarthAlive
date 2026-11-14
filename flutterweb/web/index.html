@@ -1,10 +1,6 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-  -->
   <base href="/">
 
   <meta charset="UTF-8">
@@ -23,8 +19,141 @@
 
   <title>Earth Alive</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #163A32;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+    #splash-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background-color: #163A32;
+      z-index: 999999;
+      transition: opacity 0.4s ease-out;
+    }
+    .splash-content {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      user-select: none;
+    }
+    .logo-wrapper {
+      width: 100px;
+      height: 100px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 2px solid rgba(101, 184, 145, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3), 0 0 24px rgba(101, 184, 145, 0.25);
+      animation: pulse 2.2s infinite ease-in-out;
+    }
+    .splash-logo {
+      width: 80px;
+      height: 80px;
+      border-radius: 16px;
+      object-fit: contain;
+    }
+    .splash-title {
+      margin: 22px 0 6px 0;
+      font-size: 26px;
+      font-weight: 700;
+      color: #FFFFFF;
+      letter-spacing: -0.3px;
+    }
+    .splash-subtitle {
+      margin: 0 0 28px 0;
+      font-size: 13px;
+      color: #CCE8D8;
+      letter-spacing: 0.5px;
+    }
+    .splash-loader {
+      width: 160px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .splash-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 40%;
+      background: #65B891;
+      border-radius: 4px;
+      animation: loading 1.5s infinite ease-in-out;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.04); }
+    }
+    @keyframes loading {
+      0% { left: -40%; }
+      50% { left: 100%; width: 60%; }
+      100% { left: 100%; width: 10%; }
+    }
+  </style>
 </head>
 <body>
+  <div id="splash-screen">
+    <div class="splash-content">
+      <div class="logo-wrapper">
+        <img src="splash_logo.png" alt="Earth Alive Logo" class="splash-logo" />
+      </div>
+      <h1 class="splash-title">Earth Alive</h1>
+      <p class="splash-subtitle">NASA Data Platform</p>
+      <div class="splash-loader">
+        <div class="splash-bar"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function removeSplash() {
+      var splash = document.getElementById('splash-screen');
+      if (splash && splash.style.opacity !== '0') {
+        splash.style.opacity = '0';
+        setTimeout(function() {
+          if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
+          document.body.style.overflow = '';
+        }, 400);
+      }
+    }
+    window.addEventListener('flutter-first-frame', removeSplash);
+    var observer = new MutationObserver(function(mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        var added = mutations[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          if (added[j].nodeName === 'FLUTTER-VIEW' || (added[j].id && added[j].id.indexOf('flutter') !== -1)) {
+            setTimeout(removeSplash, 200);
+            observer.disconnect();
+            return;
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true });
+    // Failsafe timeout
+    setTimeout(removeSplash, 10000);
+  </script>
+
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

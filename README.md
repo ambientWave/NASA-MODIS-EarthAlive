@@ -65,8 +65,7 @@ backend/backend/
 │   │   ├── products.json             # GENERATED from data/appeears_products.json
 │   │   ├── __init__.py               # typed Product + load_catalog/get_product
 │   │   ├── overlay.py                # curated (role, priority) + implemented products
-│   │   └── selector.py               # request → product + dates + sampling plan
-│   ├── jobs/
+│   │   └── selector.py               # request → product + dates + sampling plan│   ├── jobs/
 │   │   ├── queue.py                  # create/list/cancel + status/result lookup
 │   │   ├── store.py                  # atomic status.json/result.json storage
 │   │   ├── tasks.py                  # RQ worker entrypoints, cancellation, comparison fan-out
@@ -83,6 +82,8 @@ backend/backend/
 │   └── appeears_products.json        # verbatim GET /api/product snapshot (catalog source of truth)
 ├── tools/
 │   └── build_catalog.py              # regenerate/verify app/catalog/products.json
+├── flutterweb/
+│   └── web/                          # Flutter web build served at / and /home
 ├── docs/
 │   └── statistical_methods.md        # methodology rationale and assumptions
 ├── tests/
@@ -200,6 +201,8 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/` | Service banner |
+| GET | `/home` | Flutter web app entrypoint (`flutterweb/web/index.html`) |
+| GET | `/*` | Flutter web build assets (`main.dart.js`, `assets/`, `canvaskit/`, …) |
 | GET | `/health`, `/health/` | Unversioned liveness alias (same payload as the versioned check) |
 | GET | `/api/v1/health/` | Health check |
 | GET | `/api/v1/variables/` | List supported environmental variables (static metadata) |
@@ -212,6 +215,27 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/api/v1/analysis/jobs/{job_id}/result` | Job result, including base64 charts |
 | POST | `/api/v1/analysis/jobs/{job_id}/cancel` | Cancel a queued or running job (`?force=true` to stop immediately) |
 | GET | `/api/v1/analysis/health` | Analysis service liveness |
+
+### Web app hosting
+
+The Flutter web build lives at `flutterweb/web/` and is served by the same
+FastAPI process:
+
+- `GET /home` returns `flutterweb/web/index.html` with
+  `Cache-Control: no-cache` so a rebuild is picked up immediately.
+- The whole build directory is mounted at `/` (registered last, after every API
+  route) because `index.html` declares `<base href="/">`; `main.dart.js`,
+  `assets/`, `canvaskit/`, `manifest.json`, etc. therefore resolve from the
+  server root. Existing routes — including `/`, `/docs`, and `/api/v1/*` — take
+  precedence over the static mount.
+- If the build is missing, `/home` returns `503` with the
+  `flutter build web` instruction instead of a bare 404.
+
+The build output is checked in; replace `flutterweb/web/` with the output of
+`flutter build web --release --base-href /` from the Flutter source project,
+then restart the API. The Docker image copies `flutterweb/`, and
+`docker-compose.yml` bind-mounts it read-only into the `api` service so a
+rebuild is served without rebuilding the image.
 
 
 ### `POST /api/v1/analysis/trend`
@@ -748,6 +772,7 @@ Coverage map:
 | `test_global_aoi.py` | Dynamic AOI definitions and multi-region pipeline behavior |
 | `test_api_analysis.py` | Health endpoint, trend job submission, LST/NDVI variable selection and aliases, inline job status/result, worker error replay, invalid AOI/date rejection, zero-overlap range rejection |
 | `test_catalog_selection.py` | Catalog regeneration/checksum drift, curated-product existence, selector product/date/sampling decisions, exact `yearly + coarse + random_sample` API contract |
+| `test_web_home.py` | `/home` entrypoint, root-served Flutter assets, static mount not shadowing the API, missing-build error |
 | `test_comparison.py` | Variable registry, generic stats adapter, base64 charts, date chunking, variable/region execution |
 | `test_api_comparison.py` | Comparison job submission, validation guards (variables, dates, duplicate AOIs), status/result routes |
 | `test_encoding.py` | Base64 helper round-trips for bytes and files |

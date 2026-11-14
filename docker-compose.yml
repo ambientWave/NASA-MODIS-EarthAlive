@@ -42,6 +42,8 @@ services:
     volumes:
       # Live source for uvicorn --reload.
       - ./app:/srv/backend/backend/app
+      # Live Flutter web build (served at /home and /).
+      - ./flutterweb:/srv/backend/backend/flutterweb:ro
       # Downloaded granules and processed artifacts, shared with the host.
       - ./data:/srv/backend/data
     depends_on:

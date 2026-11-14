@@ -51,6 +51,8 @@ RUN python -m pip install --upgrade pip \
     && python -c "import rq, redis, h5netcdf, h5py, rasterio; print('analysis deps OK')"
 
 COPY app ./app
+# Flutter web build served at /home and / (see app/main.py).
+COPY flutterweb ./flutterweb
 COPY pytest.ini ./
 
 EXPOSE 8000
