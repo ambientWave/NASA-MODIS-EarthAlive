@@ -221,11 +221,16 @@ def test_analysis_trend_rejects_invalid_aoi_and_dates():
 @pytest.mark.parametrize(
     "overrides,expected",
     [
-        ({"start_date": "1999-01-01"}, "coverage start"),
-        ({"start_date": "2000-03-01", "end_date": "2035-01-01"}, "maximum"),
+        ({"start_date": "1990-01-01", "end_date": "1999-12-31"}, "no overlap"),
+        ({"start_date": "2030-01-01", "end_date": "2035-01-01"}, "no overlap"),
     ],
 )
-def test_analysis_trend_rejects_unsupported_ranges(overrides, expected):
+def test_analysis_trend_rejects_ranges_outside_product_extent(overrides, expected):
+    """Dates outside coverage are rejected only when nothing overlaps.
+
+    A partial overlap is clamped (and declared in metadata/warnings) instead of
+    being rejected, so the request still runs.
+    """
     response = TestClient(app).post("/api/v1/analysis/trend", json=_payload(**overrides))
     assert response.status_code == 400
     assert expected in response.json()["detail"]

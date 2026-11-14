@@ -720,6 +720,87 @@ The callback is wrapped so a failed status write can never abort a download.
 
 ---
 
+## 2026-11-14 - AppEEARS product catalog and one selector for every variable
+
+### Why
+
+The five variables each carried their own product/date logic, and three of them
+(`MOD11C3`, `MOD13C2`, `GPM_3IMERGM`, `M2TMNXSLV`) are not AppEEARS products at
+all. A `yearly + coarse + random_sample` request could therefore download a
+year of daily granules just to average them, or reject dates the product did
+cover.
+
+### What changed
+
+- **Generated catalog.** `tools/build_catalog.py` turns the verbatim
+  `GET /api/product` dump (`data/appeears_products.json`, 193 products) into
+  `app/catalog/products.json`: normalized granularity (`8 day` → `8_day`),
+  resolution in metres (`0.1deg` → `11132`), `step_days`, provider lag for
+  resolving `"Present"`, and availability. `--check` fails on drift.
+- **One curated overlay.** `app/catalog/overlay.py` holds only judgement:
+  `(role, priority)` per variable→product, plus the set of products each
+  collector can actually read. AppEEARS layer names live in the collectors
+  (`DEFAULT_LAYERS` in `land_surface_temperature.py`). No hand-copied dates.
+- **One selector.** `app/catalog/selector.py` resolves a request into a product,
+  an effective date range, a sampling plan and a list of declared warnings:
+  - hard filters: granularity ceiling, availability, sampling cap;
+  - `spatial_strategy` picks the resolution band;
+  - the **coarsest valid granularity** inside that band wins, then priority;
+  - the range is clamped to the product extent, then trimmed to whole
+    monthly/yearly periods (partial edge periods are excluded);
+  - `random_sample` caps granularity by `samples_per_month`
+    (1–2 → 16-day, 3–4 → 8-day, 5+ → daily).
+- **LST no longer uses `MOD11C3`.** Daily reads `MOD11A1`; monthly/yearly reads
+  `MOD11A2` 8-day composites and derives the period from them.
+  `random_sample` is applied at composite granularity: one aligned 8-day window
+  per month, submitted as one AppEEARS date range (≈12 ranges/year, one chunk
+  per year).
+- **Clamp before anything derives from dates.** The trend route resolves the
+  selection first, then derives the seed, the sampling plan, chunking and the
+  30-year cap from the *effective* range. Out-of-range requests are clamped, not
+  rejected; only a zero-overlap request is a 400.
+- **Nothing is silent.** `metadata` now carries `date_range`
+  (requested/effective/clamped/truncated), `resolution` (requested/applied/
+  basis/product/granularity/resolution), `collection` and `sampling_applied`;
+  every tier-3 substitution is also appended to `warnings`.
+- Comparison routes keep their date validation but now derive the sampling seed
+  via `resolve_seed` instead of the removed `seed_key` parameter.
+
+### Exact frontend payload (`yearly + coarse + random_sample`, 2000–2024)
+
+| Field | Value |
+| --- | --- |
+| product | `MOD11A2.061` |
+| source granularity | `8_day` (1000 m) |
+| basis / collection | `derived` / `composite` |
+| sampling_applied | `composite_window` (one 8-day window per month) |
+| effective range | `2001-01-01..2024-12-31` |
+
+Warnings emitted: start clipped to MOD11A2 availability, partial 2000/2024 years
+excluded, yearly LST derived from 8-day composites, sampling applied at
+composite granularity.
+
+### Verification
+
+- `tests/test_catalog_selection.py`: catalog regeneration + checksum match,
+  every curated product exists in AppEEARS, exact-payload selector assertions,
+  and an inline-queue API contract test asserting effective dates,
+  `source_granularity="8_day"`, `sampling_applied="composite_window"`,
+  `collection_product="MOD11A2"`, seasonal Mann-Kendall `not_supported` and the
+  corresponding warning.
+- `pytest tests -m "not integration"`: 160 passed, 2 failed, 3 deselected (the
+  two artifact-only Egypt tests).
+
+### Still outstanding
+
+- `precipitation` (GPM) and `air_temperature` (MERRA-2) already point at
+  `DAYMET` in the overlay, but their collectors still read the legacy products;
+  `catalog_selection` stays off for them until that migration lands. NDVI still
+  uses `MOD13A1` (clamp-only, no catalog selection) despite `MOD13A3` being
+  listed as the aggregate candidate.
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".

@@ -83,8 +83,9 @@ def _collection_options(payload: Any, seed_key: str) -> dict[str, Any]:
         payload.temporal_resolution,
         payload.spatial_strategy,
         payload.sampling,
-        seed_key=seed_key,
     )
+    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
+        sampling["seed"] = resolve_seed(None, fallback_key=seed_key)
     return {
         "temporal_resolution": resolution,
         "spatial_strategy": strategy,

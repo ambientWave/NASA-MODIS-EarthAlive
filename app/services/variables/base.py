@@ -56,6 +56,9 @@ class VariableSpec:
     native_resolution: str
     value_label: str
     monthly_source: PeriodSource | None = None
+    # Provider composite used when no monthly product exists (e.g. MOD11A2).
+    composite_product: str | None = None
+    composite_step_days: int = 8
 
 
 @dataclass
@@ -72,6 +75,9 @@ class CollectionRequest:
     samples_per_month: int = 1
     sampling_seed: int | None = None
     sampling_missing: str = "keep"
+    # Product chosen by the catalog selector. ``None`` keeps the collector's
+    # default product (legacy paths).
+    collection_product: str | None = None
     # Populated by the resolver: the exact ISO days selected by random sampling.
     sample_days: tuple[str, ...] | None = None
     should_cancel: Callable[[], bool] | None = None

@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from app.jobs.errors import JobCanceled
+from app.services.temporal import composite_windows
 from app.services.modis_processor import (
         PROCESSED_DATA_DIR,
         RAW_DATA_DIR,
@@ -46,6 +47,16 @@ class TimeSeriesConfig:
     cache_path: str | Path | None = None
     region_name: str | None = None
     should_cancel: Callable[[], bool] | None = None
+    # One record per sampled start date (day-level or composite-level).
+    sample_days: tuple[str, ...] | None = None
+    # 1 for daily products, 8 for MOD11A2-style composites.
+    sampling_unit_days: int = 1
+    # Explicit AppEEARS date ranges; ``None`` uses one contiguous range.
+    date_ranges: list[tuple[str, str]] | None = None
+    # AppEEARS layer names for the selected product.
+    layers: tuple[str, ...] = ("LST_Day_1km", "QC_Day")
+
+    PRODUCT_VERSIONS = {"MOD11A1": "061", "MOD11A2": "061"}
 
     def __post_init__(self) -> None:
         self.aoi = {
@@ -58,12 +69,16 @@ class TimeSeriesConfig:
             raise ValueError("AOI west must be less than east.")
         if self.aoi["south"] >= self.aoi["north"]:
             raise ValueError("AOI south must be less than north.")
-        if self.product_short_name.upper() != "MOD11A1":
-            raise ValueError("This service currently supports the MOD11A1 product only.")
+        self.product_short_name = str(self.product_short_name).upper()
+        if self.product_short_name not in self.PRODUCT_VERSIONS:
+            raise ValueError(
+                "This service currently supports MOD11A1 and MOD11A2 only."
+            )
         aggregation = self.temporal_aggregation.lower()
         if aggregation not in {"daily", "monthly", "yearly"}:
             raise ValueError("temporal_aggregation must be one of: daily, monthly, yearly.")
         self.temporal_aggregation = aggregation
+        self.sampling_unit_days = max(1, int(self.sampling_unit_days))
         self.output_dir = Path(self.output_dir) if self.output_dir is not None else TIME_SERIES_DIR
         self.cache_path = Path(self.cache_path) if self.cache_path is not None else DEFAULT_CACHE_PATH
         if self.region_name is None:
@@ -432,14 +447,16 @@ def collect_mod11a1_timeseries_appeears(config: TimeSeriesConfig) -> dict[str, A
     client = AppEEARSClient()
     client.login()
 
+    product_id = f"{config.product_short_name}.{config.PRODUCT_VERSIONS[config.product_short_name]}"
     task_name = f"lst_{config.region_name}_{config.start_date.replace('-', '')}"
+    date_ranges = list(config.date_ranges) if config.date_ranges else None
     task_id = client.submit_area_task(
         task_name=task_name,
         start_date=config.start_date,
         end_date=config.end_date,
+        date_ranges=date_ranges,
         layers=[
-            ("MOD11A1.061", "LST_Day_1km"),
-            ("MOD11A1.061", "QC_Day"),
+            (product_id, layer) for layer in config.layers
         ],
         bbox=config.aoi,
         file_type="geotiff",
@@ -472,7 +489,24 @@ def collect_mod11a1_timeseries_appeears(config: TimeSeriesConfig) -> dict[str, A
         elif "QC_Day" in p.name:
             entry["qc"] = p
 
-    date_list = date_range(config.start_date, config.end_date)
+    if config.sampling_unit_days > 1:
+        if config.date_ranges:
+            date_list = [start for start, _end in config.date_ranges]
+        elif config.sample_days:
+            date_list = sorted(config.sample_days)
+        else:
+            date_list = [
+                start
+                for start, _end in composite_windows(
+                    config.start_date,
+                    config.end_date,
+                    step_days=config.sampling_unit_days,
+                )
+            ]
+    elif config.sample_days:
+        date_list = sorted(config.sample_days)
+    else:
+        date_list = date_range(config.start_date, config.end_date)
     records: list[dict[str, Any]] = []
     raster_sum: np.ndarray | None = None
     raster_count: np.ndarray | None = None
@@ -563,8 +597,8 @@ def collect_mod11a1_timeseries_appeears(config: TimeSeriesConfig) -> dict[str, A
 
 def collect_mod11a1_timeseries(config: TimeSeriesConfig) -> dict[str, Any]:
     provider = os.getenv("MODIS_PROVIDER", "appeears").lower().strip()
-    if provider != "earthaccess":
-        log("timeseries: using NASA AppEEARS ARD extraction pipeline")
+    if config.product_short_name == "MOD11A2" or provider != "earthaccess":
+        log(f"timeseries: using NASA AppEEARS ARD extraction pipeline ({config.product_short_name})")
         return collect_mod11a1_timeseries_appeears(config)
 
     output_dir = Path(config.output_dir)

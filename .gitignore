@@ -2,7 +2,9 @@
 .env
 
 # Runtime data and caches
-data/
+data/*
+# The AppEEARS product snapshot is the source of truth for app/catalog/products.json.
+!data/appeears_products.json
 
 # Python
 __pycache__/

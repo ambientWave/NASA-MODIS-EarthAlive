@@ -156,6 +156,7 @@ class AppEEARSClient:
         geojson: dict[str, Any] | None = None,
         file_type: str = "geotiff",
         projection: str = "geographic",
+        date_ranges: list[tuple[str, str]] | None = None,
     ) -> str:
         """Submit an area sample extraction task to AppEEARS.
 
@@ -168,12 +169,21 @@ class AppEEARSClient:
             geojson: Explicit GeoJSON geometry or FeatureCollection (overrides bbox if provided).
             file_type: "geotiff" or "netcdf4".
             projection: "geographic" (EPSG:4326) or "native".
+            date_ranges: Optional list of (start, end) ranges. AppEEARS accepts a
+                list of date ranges per task, which is how composite-window
+                sampling avoids downloading the whole period.
 
         Returns:
             task_id: UUID string identifying the queued AppEEARS task.
         """
-        app_start = self._format_date(start_date)
-        app_end = self._format_date(end_date)
+        date_payload = [
+            {
+                "startDate": self._format_date(range_start),
+                "endDate": self._format_date(range_end),
+                "recurring": False,
+            }
+            for range_start, range_end in (date_ranges or [(start_date, end_date)])
+        ]
 
         if geojson is None:
             if bbox is None:
@@ -207,13 +217,7 @@ class AppEEARSClient:
             "task_type": "area",
             "task_name": task_name[:40],
             "params": {
-                "dates": [
-                    {
-                        "startDate": app_start,
-                        "endDate": app_end,
-                        "recurring": False,
-                    }
-                ],
+                "dates": date_payload,
                 "layers": [{"product": prod, "layer": lyr} for prod, lyr in layers],
                 "geo": geo_payload,
                 "output": {

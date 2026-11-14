@@ -105,6 +105,9 @@ def execute_trend_analysis(
     sampling_seed = sampling.get("seed")
     sampling_missing = str(sampling.get("missing") or "keep").lower()
     requested_methods = [str(method).lower() for method in payload["analysis_methods"]]
+    collection_product = payload.get("collection_product")
+    selection = dict(payload.get("selection") or {})
+    selection_warnings = [str(item) for item in payload.get("selection_warnings") or []]
 
     log(
         f"trend: job {job_id} starting variable={variable_id} dataset={spec.dataset} aoi={aoi} "
@@ -130,6 +133,7 @@ def execute_trend_analysis(
             samples_per_month=samples_per_month,
             sampling_seed=sampling_seed,
             sampling_missing=sampling_missing,
+            collection_product=collection_product,
         )
     except TimeoutError as exc:
         log(f"trend: job {job_id} collection timed out after {time.perf_counter() - collection_started_at:.1f}s: {exc}")
@@ -204,7 +208,7 @@ def execute_trend_analysis(
             "mode": "trend_analysis",
             "variable": spec.variable_id,
             "display_name": spec.display_name,
-            "product": spec.dataset,
+            "product": (series.source_products[0].split(".")[0] if series.source_products else spec.dataset),
             "dataset": spec.dataset,
             "unit": spec.unit,
             "native_resolution": series.source_resolution or spec.native_resolution,
@@ -213,6 +217,10 @@ def execute_trend_analysis(
             "collection_strategy": series.collection_strategy,
             "source_products": series.source_products or [spec.dataset],
             "sampling": series.sampling or {"mode": "full_period"},
+            "date_range": selection.get("date_range"),
+            "resolution": selection.get("resolution"),
+            "sampling_applied": selection.get("sampling_applied") or (series.sampling or {}).get("applied"),
+            "selection": selection or None,
             "start_date": start_date,
             "end_date": end_date,
             "aoi": aoi,
@@ -221,7 +229,9 @@ def execute_trend_analysis(
         "data_quality": analysis.get("data_quality", {}),
         "analysis_results": analysis.get("analysis_results", {}),
         "visualizations": analysis.get("visualizations", {}),
-        "warnings": sorted(set(series.warnings + analysis.get("warnings", []))),
+        "warnings": sorted(
+            set(series.warnings + analysis.get("warnings", []) + selection_warnings)
+        ),
     }
     log(
         f"trend: job {job_id} completed in {time.perf_counter() - started_at:.1f}s "

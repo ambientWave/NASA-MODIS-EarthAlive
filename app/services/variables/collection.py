@@ -4,9 +4,11 @@ Long date ranges are split into bounded chunks, collected one at a time, and
 merged by observation date. Both the comparison jobs and the trend job use this
 so chunking behavior stays identical.
 
-The chunk is also where the temporal resolution is applied: the resolver chooses
-a provider monthly product (12 files/year) or the daily product (365 files/year),
-so a ``monthly`` request never pays for daily granules it will only average away.
+The chunk is also where the temporal resolution is applied. ``collect_resolved_variable``
+reads the product the catalog selector chose for that request: a provider
+monthly/aggregate product when one exists, a coarser composite (MOD11A2) when it
+does not, or the daily product. Sampled requests are chunked one year at a time
+so each AppEEARS task carries at most ~12 date ranges.
 """
 
 from __future__ import annotations
@@ -45,15 +47,39 @@ def collect_chunked_variable(
     samples_per_month: int = 1,
     sampling_seed: int | None = None,
     sampling_missing: str = "keep",
+    collection_product: str | None = None,
     collector: Collector | None = None,
 ) -> VariableSeries:
     """Collect ``variable_id`` over ``start_date``..``end_date`` in chunks."""
     resolution = str(temporal_resolution or "daily").lower()
+    if collection_product is None:
+        # Comparisons enter here without an API-level selection; resolve the
+        # same product decision so every job reads the same dataset.
+        try:
+            from datetime import date as _date
+
+            from app.catalog.selector import resolve_selection
+
+            selection = resolve_selection(
+                variable_id,
+                _date.fromisoformat(start_date),
+                _date.fromisoformat(end_date),
+                resolution,
+                spatial_strategy,
+                sampling_mode,
+                samples_per_month,
+            )
+            collection_product = selection.product_name
+        except (ValueError, KeyError):
+            collection_product = None
     days_per_chunk = DEFAULT_MAX_DAYS_PER_JOB if max_days is None else int(max_days)
     if resolution == "daily":
         chunks = date_chunks(start_date, end_date, days_per_chunk)
     else:
-        chunks = period_chunks(start_date, end_date, max_years=max(1, days_per_chunk // 366))
+        # Sampled requests become one AppEEARS date range per observation, so
+        # keep chunks to a single year to stay well inside task-size limits.
+        max_years = 1 if sampling_mode == "random_sample" else max(1, days_per_chunk // 366)
+        chunks = period_chunks(start_date, end_date, max_years=max_years)
     if collector is None:
         collector = collect_resolved_variable
 
@@ -86,6 +112,7 @@ def collect_chunked_variable(
                 samples_per_month=samples_per_month,
                 sampling_seed=sampling_seed,
                 sampling_missing=sampling_missing,
+                collection_product=collection_product,
                 should_cancel=should_cancel,
                 progress=progress,
                 progress_label=progress_label or variable_id,

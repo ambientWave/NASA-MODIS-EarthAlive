@@ -218,6 +218,72 @@ def period_chunks(
     return chunks
 
 
+def composite_windows(
+    start_date: str,
+    end_date: str,
+    *,
+    step_days: int = 8,
+) -> list[tuple[str, str]]:
+    """Provider-aligned composite windows (MOD11A2 uses day-of-year 001, 009...).
+
+    Each window is ``(start, end)`` inclusive and never crosses the requested
+    range. Only windows that overlap the range are returned, so a request
+    starting mid-window begins with the clipped remainder of that window.
+    """
+    step = max(1, int(step_days))
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    windows: list[tuple[str, str]] = []
+    for year in range(start.year, end.year + 1):
+        cursor = date(year, 1, 1)
+        while cursor.year == year:
+            window_start = cursor
+            window_end = cursor + timedelta(days=step - 1)
+            if window_start <= end and window_end >= start:
+                clipped_start = max(window_start, start)
+                clipped_end = min(window_end, end)
+                windows.append((clipped_start.isoformat(), clipped_end.isoformat()))
+            cursor = window_end + timedelta(days=1)
+    return windows
+
+
+def composite_window_plan(
+    start_date: str,
+    end_date: str,
+    *,
+    samples_per_month: int,
+    seed: int,
+    step_days: int = 8,
+    key: str = "",
+) -> dict[str, list[tuple[str, str]]]:
+    """Pick provider-aligned composite windows, deterministically per month.
+
+    Returns ``{"YYYY-MM": [(start, end), ...]}`` with at most
+    ``samples_per_month`` windows per month. A month with fewer aligned windows
+    than requested simply returns fewer; no window is invented.
+    """
+    wanted = max(1, int(samples_per_month))
+    by_month: dict[str, list[tuple[str, str]]] = {}
+    for window in composite_windows(start_date, end_date, step_days=step_days):
+        by_month.setdefault(window[0][:7], []).append(window)
+
+    plan: dict[str, list[tuple[str, str]]] = {}
+    for period in sorted(by_month):
+        options = by_month[period]
+        rng = random.Random(f"{seed}:{key}:{period}")
+        count = min(wanted, len(options))
+        plan[period] = sorted(rng.sample(options, count))
+    return plan
+
+
+def planned_windows(plan: dict[str, list[tuple[str, str]]]) -> tuple[str, ...]:
+    return tuple(start for windows in plan.values() for start, _ in windows)
+
+
+def window_ranges(plan: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
+    return [window for windows in plan.values() for window in windows]
+
+
 def select_sampled_records(
     records: Iterable[dict[str, Any]],
     plan: dict[str, list[str]],

@@ -136,41 +136,43 @@ def test_select_sampled_records_keep_and_redraw():
     assert redrawn[0]["value"] == 7.0
 
 
-def test_resolver_uses_provider_monthly_product_for_coarse(monkeypatch):
-    spec = get_variable_spec("land_surface_temperature")
+def test_resolver_uses_composite_product_for_lst_coarse(monkeypatch):
+    spec, _ = variable_registry._REGISTRY["land_surface_temperature"]
     captured = {}
 
-    def fake_period(request, spec_arg, source):
-        captured["source"] = source.short_name
+    def fake_collect(request):
+        captured["product"] = request.collection_product
+        captured["sample_days"] = request.sample_days
         return VariableSeries(
-            spec=spec_arg,
-            records=[
-                {
-                    "observation_date": "2024-01-01",
-                    "value": 15.0,
-                    "valid_pixel_count": 10,
-                    "total_pixel_count": 10,
-                    "missing": False,
-                    "source_frequency": "monthly",
-                }
-            ],
-            frequency="monthly",
-            collection_strategy="provider_monthly",
-            source_products=[source.short_name],
-            source_resolution=source.native_resolution,
+            spec=spec,
+            records=_daily_records(request.start_date, request.end_date),
+            source_products=["MOD11A2"],
+            collection_strategy="composite",
         )
 
-    monkeypatch.setattr(variable_registry, "collect_period_variable", fake_period)
+    monkeypatch.setitem(
+        variable_registry._REGISTRY,
+        "land_surface_temperature",
+        (spec, fake_collect),
+    )
     series = collect_resolved_variable(
         "land_surface_temperature",
-        _request(temporal_resolution="monthly", spatial_strategy="coarse"),
+        _request(
+            temporal_resolution="yearly",
+            spatial_strategy="coarse",
+            sampling_mode="random_sample",
+            samples_per_month=1,
+            sampling_seed=7,
+            collection_product="MOD11A2",
+        ),
     )
 
-    assert captured["source"] == "MOD11C3"
-    assert series.collection_strategy == "provider_monthly"
-    assert series.frequency == "monthly"
-    assert series.source_products == ["MOD11C3"]
-    assert spec is not None
+    assert captured["product"] == "MOD11A2"
+    assert captured["sample_days"] is not None
+    assert len(captured["sample_days"]) == 12  # one 8-day window per month
+    assert series.frequency == "yearly"
+    assert len(series.records) == 1
+    assert series.sampling["applied"] == "composite_window"
 
 
 def test_resolver_falls_back_to_random_sampling_without_monthly_product(monkeypatch):

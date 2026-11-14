@@ -6,6 +6,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.catalog.selector import resolve_selection
 from app.jobs import create_job
 from app.services.temporal import resolve_seed
 from app.services.variables import resolve_variable_id
@@ -22,9 +23,10 @@ SUPPORTED_ANALYSIS_METHODS = {
     "t_test",
 }
 
-PRODUCT_START_DATE = date(2000, 2, 24)  # MOD11A1 v061 coverage start
 MAX_TOTAL_DAYS = 366 * 30
-
+# Earliest coverage start used by the comparison routes (MOD11A1 v061). The
+# trend route clamps per product instead of rejecting early dates.
+PRODUCT_START_DATE = date(2000, 2, 24)
 
 class AOIRequest(BaseModel):
     west: float = Field(..., ge=-180.0, le=180.0, description="Western longitude boundary in decimal degrees.")
@@ -46,9 +48,10 @@ class SamplingRequest(BaseModel):
         "full_period",
         description=(
             "Observation selection mode:\n"
-            "- `full_period` (Default): Uses every observation in the month or the NASA monthly product. "
-            "`samples_per_month` is ignored.\n"
-            "- `random_sample`: Selects N uniform random real observations per calendar month. "
+            "- `full_period` (Default): Uses every observation in the period, or the provider's "
+            "coarser product when one exists. `samples_per_month` is ignored.\n"
+            "- `random_sample`: Selects N real observations per calendar month, at the granularity "
+            "the selected product supports (individual days, or one composite window per month). "
             "Requires `samples_per_month` (1-15)."
         ),
     )
@@ -94,10 +97,13 @@ class TrendAnalysisRequest(BaseModel):
     spatial_strategy: Literal["coarse", "native"] = Field(
         "coarse",
         description=(
-            "Spatial resolution strategy for monthly/yearly aggregation:\n"
-            "- `coarse` (Default, Fast): Reads the provider's pre-packaged monthly product "
-            "(12 files/year, ~0.05° resolution).\n"
-            "- `native` (Detailed, Heavy): Aggregates all daily native resolution files.\n"
+            "Spatial resolution strategy for monthly/yearly requests:\n"
+            "- `coarse` (Default, Fast): Picks the coarsest valid product in the coarsest resolution band, "
+            "so monthly/yearly requests never download daily granules to average them.\n"
+            "- `native` (Detailed, Heavy): Picks the finest resolution band first, then the coarsest valid "
+            "granularity inside it.\n"
+            "Dates that fall outside the selected product's coverage are clamped and reported in "
+            "`metadata.date_range`.\n"
             "UI Rule: Only applicable when `temporal_resolution` is `monthly` or `yearly`."
         ),
     )
@@ -162,7 +168,6 @@ def validate_sampling_and_strategy(
     temporal_resolution: str,
     spatial_strategy: str,
     sampling: SamplingRequest,
-    seed_key: str | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     """Validate and normalize temporal resolution, spatial strategy, and sampling.
 
@@ -175,12 +180,16 @@ def validate_sampling_and_strategy(
        - `samples_per_month` is not applicable.
 
     2. Monthly / Yearly Resolution (`temporal_resolution="monthly" | "yearly"`):
-       - Mode `full_period` + Strategy `coarse`:
-         Uses NASA pre-packaged monthly composite (fastest). `samples_per_month` is ignored.
-       - Mode `full_period` + Strategy `native`:
-         Aggregates all daily native tiles in each month (detailed). `samples_per_month` is ignored.
-       - Mode `random_sample`:
-         Samples `samples_per_month` (1..15) uniformly random real days per month at native resolution.
+       - Strategy `coarse`: picks the coarsest valid product (a provider aggregate
+         if one exists, otherwise a provider composite such as MOD11A2).
+       - Strategy `native`: picks the finest resolution band first, then the
+         coarsest valid granularity inside it.
+       - Mode `full_period`: uses every observation the selected product offers.
+       - Mode `random_sample`: selects `samples_per_month` (1..15) real
+         observations per month. The granularity is capped by the sample count
+         (1-2 -> 16-day, 3-4 -> 8-day, 5+ -> daily); when no product at that
+         granularity exists, sampling happens at composite granularity and the
+         response declares ``sampling_applied="composite_window"``.
     """
     resolution = str(temporal_resolution).lower()
     if resolution not in SUPPORTED_TEMPORAL_RESOLUTION:
@@ -203,9 +212,6 @@ def validate_sampling_and_strategy(
             )
 
     sampling_dict = sampling.model_dump()
-    if sampling_dict["mode"] == "random_sample" and sampling_dict["seed"] is None:
-        sampling_dict["seed"] = resolve_seed(None, fallback_key=seed_key)
-
     return resolution, strategy, sampling_dict
 
 
@@ -235,17 +241,16 @@ def validate_sampling_and_strategy(
 def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
     variable_id = _resolve_variable(payload)
 
-    start_date = _parse_iso_date(payload.start_date, "start_date")
-    end_date = _parse_iso_date(payload.end_date, "end_date")
-    if start_date > end_date:
+    requested_start = _parse_iso_date(payload.start_date, "start_date")
+    requested_end = _parse_iso_date(payload.end_date, "end_date")
+    if requested_start > requested_end:
         raise HTTPException(status_code=400, detail="start_date must not be after end_date.")
-    if start_date < PRODUCT_START_DATE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"start_date must be on or after {PRODUCT_START_DATE.isoformat()} (earliest supported data coverage start).",
-        )
-    if (end_date - start_date).days + 1 > MAX_TOTAL_DAYS:
-        raise HTTPException(status_code=400, detail=f"Date range exceeds the {MAX_TOTAL_DAYS}-day maximum.")
+
+    temporal_resolution, spatial_strategy, sampling = validate_sampling_and_strategy(
+        payload.temporal_resolution,
+        payload.spatial_strategy,
+        payload.sampling,
+    )
 
     aoi = payload.aoi.model_dump()
     if aoi["west"] >= aoi["east"]:
@@ -253,16 +258,40 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
     if aoi["south"] >= aoi["north"]:
         raise HTTPException(status_code=400, detail="AOI south must be less than north.")
 
-    seed_key = (
-        f"{variable_id}|{start_date.isoformat()}|{end_date.isoformat()}|"
-        f"{aoi['west']},{aoi['south']},{aoi['east']},{aoi['north']}"
-    )
-    temporal_resolution, spatial_strategy, sampling = validate_sampling_and_strategy(
-        payload.temporal_resolution,
-        payload.spatial_strategy,
-        payload.sampling,
-        seed_key=seed_key,
-    )
+    # Resolve the request into one product + effective range before anything
+    # derives from the dates (seed, sampling plan, chunking, cap).
+    try:
+        selection = resolve_selection(
+            variable_id,
+            requested_start,
+            requested_end,
+            temporal_resolution,
+            spatial_strategy,
+            sampling["mode"],
+            sampling["samples_per_month"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    start_date = selection.date_range.start
+    end_date = selection.date_range.end
+    if (end_date - start_date).days + 1 > MAX_TOTAL_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Effective date range exceeds the {MAX_TOTAL_DAYS}-day maximum. "
+                "Reduce the range or choose a coarser temporal resolution."
+            ),
+        )
+
+    if sampling["mode"] == "random_sample" and sampling["seed"] is None:
+        sampling["seed"] = resolve_seed(
+            None,
+            fallback_key=(
+                f"{variable_id}|{start_date.isoformat()}|{end_date.isoformat()}|"
+                f"{aoi['west']},{aoi['south']},{aoi['east']},{aoi['north']}"
+            ),
+        )
 
     requested_methods = [str(method).lower() for method in payload.analysis_methods]
     unsupported_methods = sorted(set(requested_methods) - SUPPORTED_ANALYSIS_METHODS)
@@ -283,13 +312,16 @@ def run_trend_analysis(payload: TrendAnalysisRequest) -> dict[str, Any]:
         "spatial_strategy": spatial_strategy,
         "sampling": sampling,
         "analysis_methods": requested_methods,
+        "collection_product": selection.product_name,
+        "selection": selection.metadata(),
+        "selection_warnings": list(selection.warnings),
     }
 
     log(
         "trend: request accepted "
         f"variable={variable_id} aoi={aoi} start={start_date} end={end_date} "
         f"resolution={temporal_resolution} strategy={spatial_strategy} "
-        f"sampling={sampling['mode']} methods={requested_methods}"
+        f"sampling={sampling['mode']} product={selection.product_name} methods={requested_methods}"
     )
     try:
         job_id = create_job("trend_analysis", job_payload)

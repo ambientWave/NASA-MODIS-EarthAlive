@@ -13,6 +13,7 @@ The API is consumed by a Flutter client (hence the CORS configuration). There is
 - [Quick start](#quick-start)
 - [API reference](#api-reference)
 - [Architecture](#architecture)
+- [Data catalog and product selection](#data-catalog-and-product-selection)
 - [Workflows](#workflows)
 - [Data schemas](#data-schemas)
 - [Conventions: how to add features](#conventions-how-to-add-features)
@@ -31,7 +32,7 @@ The API is consumed by a Flutter client (hence the CORS configuration). There is
 | --- | --- |
 | HTTP | FastAPI, Uvicorn |
 | Validation | Pydantic v2 |
-| Remote data | `earthaccess` (NASA Earthdata search/download) |
+| Remote data | `earthaccess` (NASA Earthdata search/download), NASA AppEEARS REST API |
 | Raster I/O | `rasterio`, `gdal_translate` (system binary) |
 | Numerics | NumPy, pandas, SciPy |
 | Charts | Matplotlib (Agg backend) |
@@ -60,6 +61,11 @@ backend/backend/
 │   │       ├── analysis.py           # POST /api/v1/analysis/trend
 │   │       ├── comparison.py         # POST /api/v1/analysis/compare/*
 │   │       └── jobs.py               # GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel
+│   ├── catalog/
+│   │   ├── products.json             # GENERATED from data/appeears_products.json
+│   │   ├── __init__.py               # typed Product + load_catalog/get_product
+│   │   ├── overlay.py                # curated (role, priority) + implemented products
+│   │   └── selector.py               # request → product + dates + sampling plan
 │   ├── jobs/
 │   │   ├── queue.py                  # create/list/cancel + status/result lookup
 │   │   ├── store.py                  # atomic status.json/result.json storage
@@ -67,15 +73,21 @@ backend/backend/
 │   │   └── errors.py                 # JobError / JobCanceled / JobNotCancelable
 │   └── services/
 │       ├── earthdata_auth.py         # credential-aware Earthdata login (shared)
+│       ├── appeears_client.py        # NASA AppEEARS REST client (tasks, bundles, download)
 │       ├── modis_processor.py        # Earthdata search/download, GDAL, raster helpers, Egypt CLI
 │       ├── modis_timeseries.py       # per-date collection, granule cache, aggregation, CSV/JSON output
 │       ├── statistical_analysis.py   # validation + MK / modified MK / seasonal MK / OLS / HAC / Welch
 │       ├── modis_downloader.py       # DEAD CODE: duplicate of modis_processor search/download
 │       └── raster_processor.py       # QA/heatmap CLI: path arguments, auto-created output dirs
+├── data/
+│   └── appeears_products.json        # verbatim GET /api/product snapshot (catalog source of truth)
+├── tools/
+│   └── build_catalog.py              # regenerate/verify app/catalog/products.json
 ├── docs/
 │   └── statistical_methods.md        # methodology rationale and assumptions
 ├── tests/
 │   ├── test_api_analysis.py          # endpoint contract tests
+│   ├── test_catalog_selection.py     # catalog drift + selector + exact-payload contract
 │   ├── test_api_jobs.py              # job listing, details, cancellation
 │   ├── test_job_fanout.py            # comparison parts, assembly, watchdog, cancel
 │   ├── test_ndvi_cache.py            # NDVI waves, AOI cache, atomic writes, LRU trim
@@ -208,12 +220,14 @@ Request body:
 
 ```json
 {
-  "variable": "ndvi",
+  "variable": "land_surface_temperature",
   "aoi": { "west": 24.7, "south": 22.0, "east": 36.9, "north": 31.7 },
-  "start_date": "2024-01-01",
+  "start_date": "2000-01-01",
   "end_date": "2024-12-31",
-  "temporal_resolution": "monthly",
-  "analysis_methods": ["linear_regression", "mann_kendall", "t_test"]
+  "temporal_resolution": "yearly",
+  "spatial_strategy": "coarse",
+  "sampling": { "mode": "random_sample", "samples_per_month": 1, "seed": 42, "missing": "keep" },
+  "analysis_methods": ["linear_regression", "mann_kendall", "seasonal_mann_kendall"]
 }
 ```
 
@@ -221,9 +235,14 @@ Request body:
 - `product`: deprecated alias for `variable`; a dataset short name (`MOD11A1`, `MOD13A1`, `MOD13Q1`, `GPM_3IMERGD`, `SPL3SMP_E`, `M2SDNXSLV`). If both are sent they must resolve to the same variable.
 - If neither is sent, the endpoint defaults to `land_surface_temperature`.
 - `temporal_resolution`: `daily` | `monthly` | `yearly`
+- `spatial_strategy`: `coarse` (default) | `native` — picks the resolution band before granularity is chosen
+- `sampling`: `{"mode": "full_period" | "random_sample", "samples_per_month": 1-15, "seed": int|null, "missing": "keep"|"redraw"}`
 - `analysis_methods`: `linear_regression`, `mann_kendall`, `modified_mann_kendall`, `seasonal_mann_kendall`, `t_test`
-- `start_date` must be on or after `2000-02-24`; the range is capped at `366 * 30` days.
-- `monthly` and `yearly` aggregate the daily variable records to period means. Precipitation stays a mean daily rate (`mm/day`) rather than a monthly total, so all variables use the same statistic.
+- Dates outside the selected product's coverage are **clamped**, not rejected: `metadata.date_range` always reports `requested` vs `effective`, whether the range was `clamped`, and whether partial edge periods were excluded. Only a request with zero overlap returns `400`.
+- The effective range (not the requested one) drives the seed fallback, the sampling plan, chunking, and the `366 * 30`-day cap.
+- `monthly` and `yearly` use the coarsest product the variable supports (see [Data catalog and product selection](#data-catalog-and-product-selection)) and derive the period from it. No daily series is downloaded just to average it.
+- `random_sample` caps granularity by `samples_per_month`: 1–2 → 16-day, 3–4 → 8-day, 5+ → daily. When the variable has no product at that granularity, sampling happens at composite granularity (e.g. one 8-day MOD11A2 window per month) and the response says so.
+- Precipitation stays a mean daily rate (`mm/day`) rather than a monthly total, so all variables use the same statistic.
 - NDVI daily records are MODIS 16-day period values carried forward across their window (`source_frequency: "16-day"`, `coverage_status: "period_value"`). The default product is **MOD13A1 (500 m)**; set `NDVI_PRODUCT=MOD13Q1` for 250 m.
 - NDVI is analysed on a 0.005° grid (about 500 m) for MOD13A1 and 0.0025° for MOD13Q1, matching each product's native pixel size.
 
@@ -244,7 +263,25 @@ Poll `status_url`, then fetch the result envelope from `result_url`:
 {
   "success": true,
   "job_id": "9c0f...",
-  "metadata": { "mode": "trend_analysis", "variable": "ndvi", "display_name": "Vegetation Index (NDVI)", "product": "MOD13A1", "unit": "NDVI", "native_resolution": "16-day", "temporal_resolution": "monthly", "start_date": "...", "end_date": "...", "aoi": {}, "analysis_methods": [] },
+  "metadata": {
+    "mode": "trend_analysis", "variable": "land_surface_temperature", "display_name": "Land Surface Temperature",
+    "product": "MOD11A2", "unit": "Celsius", "native_resolution": "1000m", "temporal_resolution": "yearly",
+    "collection_strategy": "composite",
+    "date_range": {
+      "requested": { "start": "2000-01-01", "end": "2024-12-31" },
+      "effective": { "start": "2001-01-01", "end": "2024-12-31" },
+      "clamped": true, "truncated_partial_periods": true
+    },
+    "resolution": {
+      "requested": "yearly", "applied": "yearly", "basis": "derived",
+      "product": "MOD11A2", "product_id": "MOD11A2.061",
+      "source_granularity": "8_day", "source_granularity_label": "8-day",
+      "source_resolution": "1000m", "role": "composite"
+    },
+    "collection": "composite",
+    "sampling_applied": "composite_window", "sampling_unit": "8-day_window",
+    "start_date": "2001-01-01", "end_date": "2024-12-31", "aoi": {}, "analysis_methods": []
+  },
   "data_quality": { "observation_count": 12, "valid_observation_count": 12, "missing_observation_percentage": 0.0, "data_coverage_percentage": 98.3, "warnings": [] },
   "analysis_results": { "linear_regression": {}, "mann_kendall": {} },
   "visualizations": {
@@ -375,11 +412,11 @@ If the forced stop command cannot be delivered, the endpoint falls back to coope
 
 | Variable | Dataset | Native frequency | Notes |
 | --- | --- | --- | --- |
-| `land_surface_temperature` | MOD11A1 | daily | Existing MODIS pipeline; QA mask and Kelvin→Celsius |
+| `land_surface_temperature` | MOD11A1 (daily) / MOD11A2 (8-day) | daily / 8-day | Selected per request; QA mask and Kelvin→Celsius |
 | `ndvi` | MOD13A1 (default) / MOD13Q1 | 16-day | Each composite is carried forward across its 16-day window; 500 m by default, `NDVI_PRODUCT=MOD13Q1` for 250 m |
-| `precipitation` | GPM_3IMERGD | daily | Remote `earthaccess.open()` + xarray AOI subset |
-| `soil_moisture` | SPL3SMP_E | daily | Remote subset with retrieval-quality filtering |
-| `air_temperature` | M2SDNXSLV | daily | Kelvin→Celsius |
+| `precipitation` | GPM_3IMERGD (legacy) | daily | AppEEARS extraction; `DAYMET` is the catalog target, migration outstanding |
+| `soil_moisture` | SPL3SMP_E | daily | AppEEARS extraction with retrieval-quality filtering |
+| `air_temperature` | M2SDNXSLV (legacy) | daily | Kelvin→Celsius; `DAYMET` is the catalog target, migration outstanding |
 
 NDVI daily rows are **period values**, not interpolated observations. Each record declares `source_frequency: "16-day"` and `coverage_status: "period_value"`; days beyond the 16-day window of the last available composite are explicit missing observations.
 
@@ -432,24 +469,76 @@ Flow at a glance:
 HTTP POST /analysis/trend
    → Pydantic validation (422)
    → route-level validation (400)
+   → resolve_selection: product + effective dates + sampling plan
    → create_job("trend_analysis") → write status.json
    → enqueue on Redis (RQ) and return 202
 
 RQ worker
    → TimeSeriesConfig (dataclass validation)
-   → collect_mod11a1_timeseries
-        → earthaccess search (per day)
-        → GranuleCache (JSON on disk)
-        → earthaccess download
-        → gdal_translate ×2 per granule
-        → QA mask → Kelvin→Celsius → reproject → mosaic → summarize
-        → aggregate to daily/monthly/yearly
+   → collect_mod11a1_timeseries / product-specific collector
+        → AppEEARS task (one date range per sampled composite, or the full range)
+        → read GeoTIFFs → QA mask → Kelvin→Celsius → summarize per window
+        → derive daily/monthly/yearly records from the provider product
         → write CSV + JSON under data/jobs/{job_id}/trend/time_series/
    → _as_stats_records (schema translation)
    → validate_time_series (pandas)
    → method dispatch (linear, MK, modified MK, seasonal MK, t-test)
    → write result.json and mark status finished
 ```
+
+### Data catalog and product selection
+
+Products are never hard-coded per route. Two layers decide what is read:
+
+1. **Generated facts** — `app/catalog/products.json` is produced by
+   `tools/build_catalog.py` from `data/appeears_products.json`, a verbatim
+   `GET https://appeears.earthdatacloud.nasa.gov/api/product` dump (193
+   products). It normalises granularity (`8 day` → `8_day`), resolution
+   (`0.1deg` → `11132` m), adds `step_days`, provider publication lag, and
+   availability. Regenerate with `python tools/build_catalog.py`; `--check`
+   fails when the committed catalog is stale.
+2. **Curated judgement** — `app/catalog/overlay.py` records only
+   `(role, priority)` per variable→product, plus the set of products each
+   collector can actually read. AppEEARS layer names live in the collectors
+   (`DEFAULT_LAYERS` in `land_surface_temperature.py`), not here. Dates, extents
+   and resolutions are never hand-copied.
+
+`app/catalog/selector.py` resolves every request in this order:
+
+1. Hard filters: granularity ceiling for the requested period, availability,
+   and — for `random_sample` — the granularity cap implied by
+   `samples_per_month` (1–2 → 16-day, 3–4 → 8-day, 5+ → daily).
+2. `spatial_strategy` picks the resolution band (`coarse` = coarsest,
+   `native` = finest).
+3. The **coarsest valid granularity** inside that band wins; `(role, priority)`
+   then the product name break ties deterministically.
+4. Clamp to the product extent (using the provider lag to resolve `"Present"`).
+5. Trim to whole monthly/yearly periods so a partial edge never skews a trend.
+
+Every decision is declared in the result: `metadata.date_range`
+(`requested`/`effective`/`clamped`/`truncated_partial_periods`),
+`metadata.resolution` (`requested`/`applied`/`basis`/`product`/
+`source_granularity`/`source_resolution`), `metadata.collection`, and
+`metadata.sampling_applied`. Any substitution (sampled at composite
+granularity, period derived from composites, method unsupported) is also
+appended to `warnings`; nothing is silently swapped.
+
+Current mapping:
+
+| Variable | Daily | Monthly/yearly | Notes |
+| --- | --- | --- | --- |
+| Land surface temperature | `MOD11A1` (1 km) | `MOD11A2` 8-day composites | No AppEEARS monthly LST product exists |
+| NDVI | `MOD13A1` 16-day | `MOD13A1` (clamp only) | `MOD13A3` is the catalog aggregate candidate, not yet wired |
+| Soil moisture | `SPL3SMP_E` | sampled daily | No monthly/coarser SMAP product wired |
+| Precipitation | GPM IMERG (legacy) | sampled/composite | `DAYMET` is the AppEEARS target, migration outstanding |
+| Air temperature | MERRA-2 (legacy) | sampled/composite | `DAYMET` is the AppEEARS target, migration outstanding |
+
+The exact `yearly + coarse + random_sample` LST payload (`2000-01-01` ..
+`2024-12-31`) resolves to `MOD11A2.061`, `8_day`/1000 m,
+`basis=derived`, `collection=composite`, `sampling_applied=composite_window`,
+effective `2001-01-01..2024-12-31`, with clamp/truncation/derivation/sampling
+warnings. AppEEARS receives one aligned 8-day date range per month (about 12
+per year) and the job is chunked one year at a time.
 
 ---
 
@@ -460,9 +549,9 @@ RQ worker
 All analysis work is asynchronous.
 
 1. Pydantic validates `TrendAnalysisRequest` (literal enums, coordinate ranges) → 422 on malformed input.
-2. The handler re-validates the same constraints manually, plus the coverage start and maximum range → 400.
+2. The handler validates AOI geometry, then calls `resolve_selection` to clamp dates, choose the product and build the sampling plan → `400` only when the requested range has no overlap with the product.
 3. `create_job` writes `data/jobs/{job_id}/status.json` and enqueues `app.jobs.tasks.run_job` on the `analysis` RQ queue → `202` with `job_id`, `status_url`, `result_url`.
-4. The worker calls `execute_trend_analysis` (`app/services/trend_service.py`), which resolves the requested variable, collects it through the shared registry/chunking helper, and aggregates daily records to monthly/yearly means when needed. MOD11A1 still searches **one Earthdata query per calendar day**, plus downloads and two `gdal_translate` subprocesses per granule; the other adapters use their product-specific collectors.
+4. The worker calls `execute_trend_analysis` (`app/services/trend_service.py`), which collects the variable through the shared registry/chunking helper. LST daily requests read MOD11A1 through AppEEARS; monthly/yearly requests read MOD11A2 8-day composites and derive the period from them (one aligned window per month when sampling). The other adapters use their product-specific collectors.
 5. `_as_stats_records` (`trend_service.py`) translates between the collector and statistics vocabularies (see [Data schemas](#data-schemas)).
 6. `validate_time_series` parses dates, rejects duplicates, separates missing observations, and computes coverage warnings.
 7. Requested methods are dispatched inline in the worker.
@@ -567,15 +656,26 @@ Insufficient data is **never** raised from the statistics layer — only `valida
 
 ### Recipe: add a new satellite product
 
-Example: MOD13A1 NDVI.
+Example: adding `MOD13A3` monthly NDVI.
 
-1. Create `app/services/<product>_timeseries.py` with its own config dataclass, QA/scale constants (do **not** reuse MOD11A1 QA bits or the 0.02/273.15 conversion), and a `collect_<product>_timeseries(config)` function.
-2. Emit the canonical collector record shape, replacing temperature fields with the product's measurement fields while keeping date/pixel/missing fields identical.
-3. Extend the adapter so the new measurement reaches the statistics layer, or generalize the schema to `mean_value` + `unit`.
-4. Add the product to `SUPPORTED_PRODUCTS` in `app/api/routes/analysis.py`.
-5. Add a `unit` field to response metadata (the current envelope hardcodes temperature semantics).
-6. Add request model options and update the response example in the route docstring.
-7. Add unit tests for QA masking and aggregation, plus an integration test marked `@pytest.mark.integration`.
+1. Confirm the product is in `data/appeears_products.json`; if the snapshot
+   changed, refresh it and run `python tools/build_catalog.py`.
+2. Add `(role, priority)` for the product to the variable's entry in
+   `app/catalog/overlay.py`, and add its verified AppEEARS layer to
+   `DEFAULT_LAYERS` in the collector module. Never hand-copy dates, extents or
+   resolutions — the selector reads them from the generated catalog.
+3. Only list the product in `implemented_products` once the collector can read
+   it; until then the selector will not propose it.
+4. Create or extend `app/services/variables/<variable>.py` with its own QA/scale
+   constants (do **not** reuse MOD11A1 QA bits or the 0.02/273.15 conversion)
+   and emit the canonical collector record shape.
+5. If the product supplies provider aggregates, declare it as
+   `monthly_source` (period-grid path) or `composite_product` (composite path)
+   in the variable's `VariableSpec` so the resolver knows it can skip daily data.
+6. Add unit tests for the mapping and selector outcome, plus a contract test for
+   the API payload if the response envelope changes.
+7. Add integration coverage marked `@pytest.mark.integration` for the real
+   AppEEARS task shape.
 
 ### Recipe: add a new statistical method
 
@@ -646,7 +746,8 @@ Coverage map:
 | `test_modis_timeseries.py` | Date ranges, missing records, pixel summaries, granule cache, monthly aggregation, CSV/JSON output |
 | `test_modis_validation.py` | QA bit masking, LST validity, Kelvin conversion, artifact CRS/bounds, report fields |
 | `test_global_aoi.py` | Dynamic AOI definitions and multi-region pipeline behavior |
-| `test_api_analysis.py` | Health endpoint, trend job submission, LST/NDVI variable selection and aliases, inline job status/result, worker error replay, invalid AOI/date/range rejection |
+| `test_api_analysis.py` | Health endpoint, trend job submission, LST/NDVI variable selection and aliases, inline job status/result, worker error replay, invalid AOI/date rejection, zero-overlap range rejection |
+| `test_catalog_selection.py` | Catalog regeneration/checksum drift, curated-product existence, selector product/date/sampling decisions, exact `yearly + coarse + random_sample` API contract |
 | `test_comparison.py` | Variable registry, generic stats adapter, base64 charts, date chunking, variable/region execution |
 | `test_api_comparison.py` | Comparison job submission, validation guards (variables, dates, duplicate AOIs), status/result routes |
 | `test_encoding.py` | Base64 helper round-trips for bytes and files |
