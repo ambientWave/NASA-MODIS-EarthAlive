@@ -826,6 +826,79 @@ entrypoint, root-level assets return 200, `/` still returns the JSON banner and
 
 ---
 
+## 2026-11-14 - `/home` returns 503/500 on the server: build not deployed
+
+The deployed API answered `/home` with `503` and root assets (`/main.dart.js`,
+`/flutter_bootstrap.js`) with `500`:
+
+```json
+{"detail":"Flutter web build not found. Run `flutter build web` so that
+'/srv/backend/backend/flutterweb/web/index.html' exists."}
+```
+
+Root cause: the server is running the new `app/main.py` but its
+`/srv/backend/backend/flutterweb/` directory is missing. The `api` service bind
+mounts `./app`, so route changes appear immediately, while the image and
+compose file on the server predate the Flutter build being added. Starlette's
+`StaticFiles` raises a `RuntimeError` for every request when its directory is
+absent, which surfaced as `500` on assets.
+
+Hardening in `app/main.py`:
+
+- `FLUTTER_WEB_DIR` env override (absolute or repo-relative) for deployments
+  that keep the build outside the checkout.
+- The `/` static mount is registered only when the directory exists, so a
+  missing build now yields `404` for assets instead of `500`.
+- The `503` detail names the resolved path and the env override.
+
+Deployment fix (required to serve the app): `git pull && docker compose up -d
+--build` on the server, or `docker compose up -d` to apply the `./flutterweb`
+bind mount. Copying only `app/` leaves the frontend out.
+
+---
+
+## 2026-11-14 - PDF export fixed for daily analyses
+
+`GET /api/v1/analysis/jobs/{job_id}/pdf` returned HTTP 500 on the deployed
+server. Reproduced locally with a daily trend result:
+
+```
+AttributeError: 'NoneType' object has no attribute 'title'
+  pdf_report_service.py:114  meta.get('spatial_strategy', 'Standard').title()
+```
+
+Daily analyses set `spatial_strategy: null` in their metadata (there is no
+spatial resolution choice to make), so `.title()` was called on `None`.
+`dict.get(key, default)` only applies the default when the key is **absent**,
+not when it is present and `None`.
+
+### Fixes
+
+- Added `_text`, `_number`, `_title`, and `_as_dict` helpers and routed every
+  rendered metadata/quality/statistics value through them, so null and NaN
+  values print `N/A` (or "Not applicable (daily)") instead of raising.
+  `visualizations` and `analysis_results` are also normalised to dicts, and
+  comparison entries that are not dicts are skipped.
+- The report now reads the statistics layer's real keys
+  (`trend_direction`, `slope_per_year`, `slope_celsius_per_year`) in addition to
+  the legacy `trend` / `slope`, so trend direction and slope are no longer
+  silently "N/A".
+- Chart lookup matches what the analysis layer actually emits: method charts
+  (`linear_regression`, `mann_kendall`, …) and `heatmap` for trend pages,
+  `timeseries_comparison` / `trend_summary` / `coverage_comparison` for
+  comparisons. Previously the PDF only looked for keys that production never
+  produced, so reports had no charts.
+- `datetime.utcnow()` replaced with `datetime.now(timezone.utc)`.
+- Rendering is wrapped in a process-wide `threading.Lock` because matplotlib
+  pyplot state is global and sync FastAPI routes run in a threadpool.
+
+Verified with `tests/test_pdf_report.py` (10 tests): the daily trend, daily
+variable comparison, region comparison (including a failed region part),
+production statistics keys, production chart keys, and the `/pdf` endpoint
+(binary and base64).
+
+---
+
 ## Known follow-ups from this work
 
 - **Real data runs are still blocked by GDAL.** `gdal_translate` is not on `PATH`, and the `rasterio` wheel's GDAL has no HDF4 driver, so MOD11A1 `.hdf` subdatasets cannot be extracted. Requires a conda/OSGeo4W GDAL with HDF4, or a `GDAL_TRANSLATE` path pointing at one. Inside the Docker image this is solved by `/opt/gdal/bin/gdal_translate`; local runs still need it configured. The API returns `503` with that guidance instead of `404` "no valid observations".

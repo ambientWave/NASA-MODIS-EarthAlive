@@ -38,6 +38,19 @@ def test_static_mount_does_not_shadow_the_api():
     assert client.get("/api/v1/health/").status_code == 200
 
 
+def test_flutter_web_dir_can_be_relocated(monkeypatch, tmp_path):
+    """Deployments may keep the build outside the repository (FLUTTER_WEB_DIR)."""
+    monkeypatch.setenv("FLUTTER_WEB_DIR", str(tmp_path))
+
+    assert main_module.resolve_flutter_web_dir() == tmp_path
+
+
+def test_flutter_web_dir_accepts_a_relative_override(monkeypatch):
+    monkeypatch.setenv("FLUTTER_WEB_DIR", "flutterweb/web")
+
+    assert main_module.resolve_flutter_web_dir() == main_module.PROJECT_ROOT / "flutterweb" / "web"
+
+
 def test_home_reports_a_missing_build(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "FLUTTER_INDEX", tmp_path / "index.html")
 

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -9,7 +10,24 @@ from app.api.routes import analysis, comparison, health, jobs, variables
 
 # ``app/main.py`` -> repository root (the directory that contains ``flutterweb/``).
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FLUTTER_WEB_DIR = PROJECT_ROOT / "flutterweb" / "web"
+
+
+def resolve_flutter_web_dir() -> Path:
+    """Locate the Flutter build, allowing deployments to relocate it.
+
+    ``FLUTTER_WEB_DIR`` (absolute, or relative to the repository root) wins;
+    otherwise the checked-in ``flutterweb/web`` directory is used.
+    """
+    override = os.environ.get("FLUTTER_WEB_DIR", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            path = (PROJECT_ROOT / path).resolve()
+        return path
+    return PROJECT_ROOT / "flutterweb" / "web"
+
+
+FLUTTER_WEB_DIR = resolve_flutter_web_dir()
 FLUTTER_INDEX = FLUTTER_WEB_DIR / "index.html"
 
 
@@ -80,8 +98,10 @@ def flutter_home() -> FileResponse:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Flutter web build not found. Run `flutter build web` so that "
-                f"'{FLUTTER_INDEX}' exists."
+                f"Flutter web build not found at '{FLUTTER_INDEX}'. Run "
+                "`flutter build web` so that the build exists, copy "
+                "`flutterweb/` into the deployment, or set `FLUTTER_WEB_DIR` "
+                "to the built app directory."
             ),
         )
     return FileResponse(
@@ -94,9 +114,12 @@ def flutter_home() -> FileResponse:
 
 
 # Registered last so every API route (and ``/``) wins over the static mount.
-# ``check_dir=False`` keeps the app importable before the first web build.
-app.mount(
-    "/",
-    StaticFiles(directory=FLUTTER_WEB_DIR, html=True, check_dir=False),
-    name="flutter-web",
-)
+# Mounting a missing directory makes StaticFiles raise ``RuntimeError`` (a 500)
+# for every asset request, so only mount when the build has been deployed.
+# ``--reload`` picks up the directory when it appears later.
+if FLUTTER_WEB_DIR.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=FLUTTER_WEB_DIR, html=True),
+        name="flutter-web",
+    )

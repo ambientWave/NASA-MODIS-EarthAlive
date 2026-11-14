@@ -91,6 +91,8 @@ backend/backend/
 │   ├── test_catalog_selection.py     # catalog drift + selector + exact-payload contract
 │   ├── test_api_jobs.py              # job listing, details, cancellation
 │   ├── test_job_fanout.py            # comparison parts, assembly, watchdog, cancel
+│   ├── test_pdf_report.py            # PDF export: daily/comparison/region + endpoint
+│   ├── test_web_home.py              # /home entrypoint + root-served Flutter assets
 │   ├── test_ndvi_cache.py            # NDVI waves, AOI cache, atomic writes, LRU trim
 │   ├── test_statistical_analysis.py  # statistics unit tests
 │   ├── test_modis_timeseries.py      # collection/aggregation unit tests + integration
@@ -203,7 +205,6 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/` | Service banner |
 | GET | `/home` | Flutter web app entrypoint (`flutterweb/web/index.html`) |
 | GET | `/*` | Flutter web build assets (`main.dart.js`, `assets/`, `canvaskit/`, …) |
-| GET | `/health`, `/health/` | Unversioned liveness alias (same payload as the versioned check) |
 | GET | `/api/v1/health/` | Health check |
 | GET | `/api/v1/variables/` | List supported environmental variables (static metadata) |
 | GET | `/api/v1/variables/{variable_id}` | Single variable metadata |
@@ -213,6 +214,7 @@ Integration tests hit live NASA Earthdata and download files; exclude them unles
 | GET | `/api/v1/analysis/jobs` | List jobs, newest first, with filters and pagination |
 | GET | `/api/v1/analysis/jobs/{job_id}` | Job status, progress, and the original request |
 | GET | `/api/v1/analysis/jobs/{job_id}/result` | Job result, including base64 charts |
+| GET | `/api/v1/analysis/jobs/{job_id}/pdf` | PDF report for a finished job (`?format=base64` for JSON) |
 | POST | `/api/v1/analysis/jobs/{job_id}/cancel` | Cancel a queued or running job (`?force=true` to stop immediately) |
 | GET | `/api/v1/analysis/health` | Analysis service liveness |
 
@@ -229,7 +231,11 @@ FastAPI process:
   server root. Existing routes — including `/`, `/docs`, and `/api/v1/*` — take
   precedence over the static mount.
 - If the build is missing, `/home` returns `503` with the
-  `flutter build web` instruction instead of a bare 404.
+  `flutter build web` instruction instead of a bare 404. The static mount is
+  only registered when the directory exists, so a missing build yields `404`
+  for assets rather than Starlette's `500` "directory does not exist".
+- `FLUTTER_WEB_DIR` relocates the build (absolute, or relative to the
+  repository root) for deployments that keep it outside the checkout.
 
 The build output is checked in; replace `flutterweb/web/` with the output of
 `flutter build web --release --base-href /` from the Flutter source project,
@@ -237,6 +243,38 @@ then restart the API. The Docker image copies `flutterweb/`, and
 `docker-compose.yml` bind-mounts it read-only into the `api` service so a
 rebuild is served without rebuilding the image.
 
+> **Deploying this change requires a container update.** A server that only
+> bind-mounts `./app` (or runs an image built before `COPY flutterweb`) has the
+> new `/home` route but no build, which is exactly the `503` above. On the
+> server run `git pull && docker compose up -d --build` (or, if the compose file
+> already mounts `./flutterweb`, `docker compose up -d` to recreate the
+> container). Copying only `app/` is not enough.
+
+### PDF reports
+
+`GET /api/v1/analysis/jobs/{job_id}/pdf` renders a multi-page report for a
+finished job. It supports every analysis mode and both daily and
+monthly/yearly resolutions:
+
+- **Trend analyses** → metadata/quality KPIs, the trend chart, the mean raster,
+  a statistical-method table, and the warning list.
+- **Variable and region comparisons** → overview table, the comparison
+  time-series chart, side-by-side entity pages, and the synthesis charts
+  (`trend_summary`, `coverage_comparison`).
+
+Only a finished job can be exported. The response is a binary PDF
+(`Content-Disposition: inline`) by default; `?format=base64` returns JSON with
+`pdf_base64`, and `?download=true` switches to an attachment filename.
+
+Metadata fields are nullable (for example `spatial_strategy` is `null` for
+daily analyses), so the renderer formats every value defensively and falls back
+to `N/A` / "Not applicable (daily)" instead of raising. It also reads the
+current statistics keys (`trend_direction`, `slope_per_year`,
+`slope_celsius_per_year`) alongside the legacy `trend` / `slope` names.
+
+Rendering is serialised with a process-wide lock because matplotlib's pyplot
+state is global and FastAPI runs sync endpoints in a threadpool; concurrent
+exports therefore queue instead of corrupting each other's figures.
 
 ### `POST /api/v1/analysis/trend`
 
@@ -773,6 +811,7 @@ Coverage map:
 | `test_api_analysis.py` | Health endpoint, trend job submission, LST/NDVI variable selection and aliases, inline job status/result, worker error replay, invalid AOI/date rejection, zero-overlap range rejection |
 | `test_catalog_selection.py` | Catalog regeneration/checksum drift, curated-product existence, selector product/date/sampling decisions, exact `yearly + coarse + random_sample` API contract |
 | `test_web_home.py` | `/home` entrypoint, root-served Flutter assets, static mount not shadowing the API, missing-build error |
+| `test_pdf_report.py` | PDF export for daily/monthly trends, variable and region comparisons, production stat/chart keys, `/pdf` binary and base64 responses |
 | `test_comparison.py` | Variable registry, generic stats adapter, base64 charts, date chunking, variable/region execution |
 | `test_api_comparison.py` | Comparison job submission, validation guards (variables, dates, duplicate AOIs), status/result routes |
 | `test_encoding.py` | Base64 helper round-trips for bytes and files |

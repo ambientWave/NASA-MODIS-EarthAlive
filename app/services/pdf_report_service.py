@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import base64
 import io
-from datetime import datetime
+import math
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,52 @@ COLOR_BORDER = "#E2E8F0"       # Subtle divider
 COLOR_TEXT_DARK = "#0F172A"    # High contrast text
 COLOR_SUCCESS = "#059669"      # Emerald Green
 COLOR_WARNING = "#D97706"      # Amber
+
+# Matplotlib's pyplot state is process-global and not thread-safe. The PDF
+# route is a sync endpoint, so FastAPI runs it in a threadpool; serialise
+# rendering so two concurrent exports cannot corrupt each other's figures.
+_PDF_LOCK = threading.Lock()
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Coerce a payload entry to a dict so rendering never assumes a shape."""
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value: Any, default: str = "N/A") -> str:
+    """Render a nullable payload field without ever calling ``.title()`` on None."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _number(value: Any, fmt: str = "{:.1f}", default: str = "N/A") -> str:
+    """Format a possibly-missing numeric value (``None`` and NaN included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if not math.isfinite(float(value)):
+        return default
+    return fmt.format(float(value))
+
+
+def _title(value: Any, default: str = "N/A") -> str:
+    return _text(value, default).replace("_", " ").title()
+
+
+def _trend_direction(stats: dict[str, Any]) -> str:
+    """Read the Mann-Kendall direction across both current and legacy keys."""
+    mk = stats.get("mann_kendall") or {}
+    return _title(mk.get("trend_direction") or mk.get("trend"))
+
+
+def _slope_value(stats: dict[str, Any]) -> float | None:
+    lr = stats.get("linear_regression") or {}
+    for key in ("slope_per_year", "slope_celsius_per_year", "slope"):
+        value = lr.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
 
 
 def _decode_b64_image(image_payload: Any) -> Image.Image | None:
@@ -63,12 +111,15 @@ def _decode_b64_image(image_payload: Any) -> Image.Image | None:
 
 def _add_page_header(fig: plt.Figure, title: str, subtitle: str, job_id: str) -> None:
     """Draw a clean, modern header bar across the top of the page."""
+    title = _text(title, "Analysis Report")
+    subtitle = _text(subtitle, "")
+    job_id = _text(job_id, "N/A")
     # Top banner rect
     fig.text(0.06, 0.955, title.upper(), fontsize=15, fontweight="bold", color=COLOR_PRIMARY, family="sans-serif")
     fig.text(0.06, 0.935, subtitle, fontsize=9.5, color=COLOR_SECONDARY, family="sans-serif")
     
     # Job ID & timestamp badge on right
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     fig.text(0.94, 0.955, f"JOB: {job_id[:16]}...", fontsize=8.5, fontweight="bold", color=COLOR_ACCENT, ha="right", family="sans-serif")
     fig.text(0.94, 0.935, f"Generated: {timestamp}", fontsize=8, color=COLOR_SECONDARY, ha="right", family="sans-serif")
 
@@ -87,12 +138,12 @@ def _add_page_footer(fig: plt.Figure, page_num: int, total_pages: int | None = N
 
 def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     """Render a single-variable trend analysis report."""
-    meta = result.get("metadata", {})
-    quality = result.get("data_quality", {})
-    stats = result.get("analysis_results", {})
-    vis = result.get("visualizations", {})
-    warnings = result.get("warnings", [])
-    job_id = result.get("job_id", meta.get("job_id", "N/A"))
+    meta = result.get("metadata") or {}
+    quality = result.get("data_quality") or {}
+    stats = result.get("analysis_results") or {}
+    vis = result.get("visualizations") or {}
+    warnings = result.get("warnings") or []
+    job_id = _text(result.get("job_id") or meta.get("job_id"), "N/A")
 
     # PAGE 1: Overview, KPI cards, and Trend charts
     fig = plt.figure(figsize=(8.5, 11), dpi=150)
@@ -100,18 +151,19 @@ def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     _add_page_header(
         fig,
         title="Environmental Trend Analysis Report",
-        subtitle=f"Variable: {meta.get('display_name', meta.get('variable', 'N/A'))} ({meta.get('dataset', 'N/A')})",
+        subtitle=f"Variable: {_text(meta.get('display_name') or meta.get('variable'))} ({_text(meta.get('dataset'))})",
         job_id=job_id,
     )
 
     # Metadata Grid Box
+    aoi = meta.get("aoi") or {}
     meta_text = (
-        f"• Date Range: {meta.get('start_date', 'N/A')} → {meta.get('end_date', 'N/A')}  |  "
-        f"Resolution: {meta.get('temporal_resolution', 'daily').title()}  |  "
-        f"Unit: {meta.get('unit', 'N/A')}\n"
-        f"• AOI Bounds: West {meta.get('aoi', {}).get('west')}, South {meta.get('aoi', {}).get('south')}, "
-        f"East {meta.get('aoi', {}).get('east')}, North {meta.get('aoi', {}).get('north')}\n"
-        f"• Provider: NASA AppEEARS ARD  |  Spatial Strategy: {meta.get('spatial_strategy', 'Standard').title()}"
+        f"• Date Range: {_text(meta.get('start_date'))} → {_text(meta.get('end_date'))}  |  "
+        f"Resolution: {_title(meta.get('temporal_resolution'), 'Daily')}  |  "
+        f"Unit: {_text(meta.get('unit'))}\n"
+        f"• AOI Bounds: West {aoi.get('west')}, South {aoi.get('south')}, "
+        f"East {aoi.get('east')}, North {aoi.get('north')}\n"
+        f"• Provider: NASA AppEEARS ARD  |  Spatial Strategy: {_title(meta.get('spatial_strategy'), 'Not applicable (daily)')}"
     )
     fig.text(
         0.06, 0.885, meta_text,
@@ -122,23 +174,20 @@ def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     # Data Quality & Statistical Summary Cards
     obs_total = quality.get("observation_count", "N/A")
     obs_valid = quality.get("valid_observation_count", "N/A")
-    coverage_pct = quality.get("data_coverage_percentage", 0.0)
+    coverage_pct = _number(quality.get("data_coverage_percentage"), "{:.1f}", "0.0")
 
     # Extract Primary Stats
-    lr = stats.get("linear_regression", {})
-    mk = stats.get("mann_kendall", {})
-    slope = lr.get("slope")
-    slope_str = f"{slope:+.4f}" if isinstance(slope, (int, float)) else "N/A"
-    r2 = lr.get("r_squared")
-    r2_str = f"{r2:.3f}" if isinstance(r2, (int, float)) else "N/A"
-    p_val = lr.get("p_value")
-    p_str = f"{p_val:.4f}" if isinstance(p_val, (int, float)) else "N/A"
-    trend_dir = mk.get("trend", "N/A").title()
+    lr = stats.get("linear_regression") or {}
+    slope = _slope_value(stats)
+    slope_str = f"{slope:+.4f}" if slope is not None else "N/A"
+    r2_str = _number(lr.get("r_squared"), "{:.3f}")
+    p_str = _number(lr.get("p_value"), "{:.4f}")
+    trend_dir = _trend_direction(stats)
 
     kpi_text = (
-        f"Data Coverage: {coverage_pct:.1f}% ({obs_valid}/{obs_total} valid days)    |    "
+        f"Data Coverage: {coverage_pct}% ({obs_valid}/{obs_total} valid days)    |    "
         f"Trend Direction: {trend_dir}    |    "
-        f"Slope: {slope_str} {meta.get('unit', '')}/period    |    "
+        f"Slope: {slope_str} {_text(meta.get('unit'), '')}/period    |    "
         f"R²: {r2_str} (p = {p_str})"
     )
     fig.text(
@@ -147,9 +196,21 @@ def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
         bbox=dict(boxstyle="round,pad=0.5", facecolor="#EEF2FF", edgecolor="#C7D2FE", linewidth=1),
     )
 
-    # Visualizations (Time Series Trend & Mean Raster)
-    img_trend = _decode_b64_image(vis.get("trend_line") or vis.get("time_series"))
-    img_map = _decode_b64_image(vis.get("mean_raster") or vis.get("spatial_distribution"))
+    # Visualizations (Time Series Trend & Mean Raster). The analysis layer emits
+    # method-named charts (``linear_regression``, ``mann_kendall``) plus
+    # ``heatmap``; the legacy keys are kept as fallbacks.
+    img_trend = _decode_b64_image(
+        vis.get("trend_line")
+        or vis.get("time_series")
+        or vis.get("linear_regression")
+        or vis.get("mann_kendall")
+        or vis.get("modified_mann_kendall")
+        or vis.get("seasonal_mann_kendall")
+        or vis.get("t_test")
+    )
+    img_map = _decode_b64_image(
+        vis.get("mean_raster") or vis.get("spatial_distribution") or vis.get("heatmap")
+    )
 
     if img_trend and img_map:
         # Stacked display: Trend on top, Map on bottom
@@ -194,14 +255,13 @@ def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
             if not isinstance(result_data, dict):
                 continue
             name_clean = method_name.replace("_", " ").title()
-            p = result_data.get("p_value")
-            p_val_str = f"{p:.4e}" if isinstance(p, float) else "N/A"
+            p_val_str = _number(result_data.get("p_value"), "{:.4e}")
             stat_summary = ", ".join(
-                f"{k}: {v:.3f}" if isinstance(v, float) else f"{k}: {v}"
+                f"{k}: {v:.3f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else f"{k}: {v}"
                 for k, v in list(result_data.items())[:3]
                 if k not in ("warnings", "status")
             )
-            rows.append([name_clean, result_data.get("status", "calculated").title(), p_val_str, stat_summary])
+            rows.append([name_clean, _title(result_data.get("status"), "Calculated"), p_val_str, stat_summary])
 
         if rows:
             ax_tbl = fig2.add_axes([0.06, 0.60, 0.88, 0.28])
@@ -240,13 +300,18 @@ def _render_trend_report(pdf: PdfPages, result: dict[str, Any]) -> None:
 
 def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     """Render a multi-variable or multi-region comparison with side-by-side data and images."""
-    meta = result.get("metadata", {})
-    mode = meta.get("mode", "comparison")
-    job_id = result.get("job_id", meta.get("job_id", "N/A"))
+    meta = result.get("metadata") or {}
+    mode = _text(meta.get("mode"), "")
+    job_id = _text(result.get("job_id") or meta.get("job_id"), "N/A")
 
     is_variable_comp = "variables" in result or mode == "variable_comparison"
-    items_dict = result.get("variables") if is_variable_comp else result.get("regions", {})
-    comparison_vis = result.get("comparison", {}).get("visualizations", {})
+    items_dict = result.get("variables") if is_variable_comp else result.get("regions")
+    if not isinstance(items_dict, dict):
+        items_dict = {}
+    comparison = result.get("comparison") or {}
+    comparison_vis = comparison.get("visualizations") or {}
+    if not isinstance(comparison_vis, dict):
+        comparison_vis = {}
 
     item_keys = list(items_dict.keys())
 
@@ -260,15 +325,15 @@ def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     _add_page_header(fig, title=report_title, subtitle=subtitle_desc, job_id=job_id)
 
     # Global Parameters Card
-    aoi = meta.get("aoi", {})
+    aoi = meta.get("aoi") or {}
     aoi_desc = (
         f"West {aoi.get('west')}, South {aoi.get('south')}, East {aoi.get('east')}, North {aoi.get('north')}"
-        if isinstance(aoi, dict) else "Multiple custom AOI polygons"
+        if isinstance(aoi, dict) and aoi else "Multiple custom AOI polygons"
     )
     meta_box = (
-        f"• Comparison Period: {meta.get('start_date', 'N/A')} → {meta.get('end_date', 'N/A')}\n"
-        f"• Shared Resolution: {meta.get('temporal_resolution', 'monthly').title()}  |  "
-        f"Strategy: {meta.get('spatial_strategy', 'Standard').title()}\n"
+        f"• Comparison Period: {_text(meta.get('start_date'))} → {_text(meta.get('end_date'))}\n"
+        f"• Shared Resolution: {_title(meta.get('temporal_resolution'), 'Monthly')}  |  "
+        f"Strategy: {_title(meta.get('spatial_strategy'), 'Not applicable (daily)')}\n"
         f"• Region/AOI: {aoi_desc}\n"
         f"• NASA Engine: AppEEARS Cloud ARD Pipeline"
     )
@@ -281,23 +346,22 @@ def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     # Comparative Metric Table across all items
     tbl_rows = []
     for k in item_keys:
-        item = items_dict[k]
-        m = item.get("metadata", {})
-        label = m.get("variable_id") or m.get("display_name") or k
-        dataset = m.get("dataset", "N/A")
-        unit = m.get("unit", "")
-        q = item.get("data_quality", {})
-        cov = f"{q.get('data_coverage_percentage', 0):.1f}%"
+        item = items_dict[k] if isinstance(items_dict[k], dict) else {}
+        m = item.get("metadata") or {}
+        label = _text(m.get("variable_id") or m.get("display_name"), str(k))
+        dataset = _text(m.get("dataset"))
+        unit = _text(m.get("unit"), "")
+        q = item.get("data_quality") or {}
+        cov = _number(q.get("data_coverage_percentage"), "{:.1f}", "0.0")
         valid_cnt = q.get("valid_observation_count", "N/A")
 
         # Trend & Slope
-        lr = item.get("analysis_results", {}).get("linear_regression", {})
-        slope = lr.get("slope")
-        slope_str = f"{slope:+.3e}" if isinstance(slope, float) else "N/A"
-        mk = item.get("analysis_results", {}).get("mann_kendall", {})
-        trend = mk.get("trend", "N/A").title()
+        results = item.get("analysis_results") or {}
+        slope = _slope_value(results)
+        slope_str = f"{slope:+.3e}" if slope is not None else "N/A"
+        trend = _trend_direction(results)
 
-        tbl_rows.append([str(label).upper(), dataset, f"{cov} ({valid_cnt})", slope_str, trend, unit])
+        tbl_rows.append([str(label).upper(), dataset, f"{cov}% ({valid_cnt})", slope_str, trend, unit])
 
     if tbl_rows:
         ax_overview = fig.add_axes([0.06, 0.56, 0.88, 0.28])
@@ -322,6 +386,8 @@ def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
         comparison_vis.get("multi_variable_series")
         or comparison_vis.get("multi_region_series")
         or comparison_vis.get("overview")
+        # ``comparison_charts`` emits this key for both comparison modes.
+        or comparison_vis.get("timeseries_comparison")
     )
     if multi_chart:
         ax_chart1 = fig.add_axes([0.06, 0.10, 0.88, 0.42])
@@ -345,15 +411,17 @@ def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
         k1 = item_keys[i]
         k2 = item_keys[i + 1] if i + 1 < len(item_keys) else None
 
-        subtitle_pair = f"Side-by-Side Analysis: {k1.upper()}" + (f" vs {k2.upper()}" if k2 else "")
+        subtitle_pair = f"Side-by-Side Analysis: {str(k1).upper()}" + (
+            f" vs {str(k2).upper()}" if k2 else ""
+        )
         _add_page_header(fig_pair, title="Comparative Entity Diagnostics", subtitle=subtitle_pair, job_id=job_id)
 
         # Left Column: Item 1
-        _render_entity_column(fig_pair, items_dict[k1], col_x=0.06, col_w=0.42, label=k1)
+        _render_entity_column(fig_pair, _as_dict(items_dict.get(k1)), col_x=0.06, col_w=0.42, label=str(k1))
 
         # Right Column: Item 2 (if present)
         if k2:
-            _render_entity_column(fig_pair, items_dict[k2], col_x=0.52, col_w=0.42, label=k2)
+            _render_entity_column(fig_pair, _as_dict(items_dict.get(k2)), col_x=0.52, col_w=0.42, label=str(k2))
         else:
             fig_pair.text(0.70, 0.50, "[ Single entity on this page ]", ha="center", color=COLOR_SECONDARY)
 
@@ -368,6 +436,9 @@ def _render_comparison_report(pdf: PdfPages, result: dict[str, Any]) -> None:
     # Find all comparison synthesis charts (correlation matrix, scatter, etc.)
     comp_images = []
     for chart_key, chart_data in comparison_vis.items():
+        if chart_key == "timeseries_comparison":
+            # Already rendered on the overview page.
+            continue
         img = _decode_b64_image(chart_data)
         if img:
             comp_images.append((chart_key.replace("_", " ").title(), img))
@@ -417,32 +488,30 @@ def _render_entity_column(
     label: str,
 ) -> None:
     """Render one entity's statistics, metadata, and charts in a side-by-side column."""
-    meta = entity_data.get("metadata", {})
-    quality = entity_data.get("data_quality", {})
-    stats = entity_data.get("analysis_results", {})
-    vis = entity_data.get("visualizations", {})
+    meta = entity_data.get("metadata") or {}
+    quality = entity_data.get("data_quality") or {}
+    stats = entity_data.get("analysis_results") or {}
+    vis = entity_data.get("visualizations") or {}
 
-    disp_name = meta.get("display_name") or label.upper()
-    unit = meta.get("unit", "")
-    dataset = meta.get("dataset", "N/A")
+    disp_name = _text(meta.get("display_name"), label.upper())
+    unit = _text(meta.get("unit"), "")
+    dataset = _text(meta.get("dataset"))
 
     # Column Title Card
     fig.text(col_x, 0.885, disp_name, fontsize=11, fontweight="bold", color=COLOR_PRIMARY)
     fig.text(col_x, 0.865, f"Dataset: {dataset}  |  Unit: {unit}", fontsize=8, color=COLOR_SECONDARY)
 
     # Key Statistics & Quality Box
-    cov = quality.get("data_coverage_percentage", 0.0)
+    cov = _number(quality.get("data_coverage_percentage"), "{:.1f}", "0.0")
     v_obs = quality.get("valid_observation_count", "N/A")
     t_obs = quality.get("observation_count", "N/A")
-    lr = stats.get("linear_regression", {})
-    slope = lr.get("slope")
-    slope_str = f"{slope:+.4f}" if isinstance(slope, float) else "N/A"
-    p_val = lr.get("p_value")
-    p_str = f"{p_val:.4f}" if isinstance(p_val, float) else "N/A"
-    trend = stats.get("mann_kendall", {}).get("trend", "N/A").title()
+    slope = _slope_value(stats)
+    slope_str = f"{slope:+.4f}" if slope is not None else "N/A"
+    p_str = _number((stats.get("linear_regression") or {}).get("p_value"), "{:.4f}")
+    trend = _trend_direction(stats)
 
     stats_card = (
-        f"Valid Obs: {v_obs}/{t_obs} ({cov:.1f}%)\n"
+        f"Valid Obs: {v_obs}/{t_obs} ({cov}%)\n"
         f"Trend: {trend}\n"
         f"Slope: {slope_str} {unit}\n"
         f"Significance: p = {p_str}"
@@ -454,8 +523,15 @@ def _render_entity_column(
     )
 
     # Entity Images: Time series chart and Raster Map
-    img_time = _decode_b64_image(vis.get("trend_line") or vis.get("time_series"))
-    img_map = _decode_b64_image(vis.get("mean_raster") or vis.get("spatial_distribution"))
+    img_time = _decode_b64_image(
+        vis.get("trend_line")
+        or vis.get("time_series")
+        or vis.get("linear_regression")
+        or vis.get("mann_kendall")
+    )
+    img_map = _decode_b64_image(
+        vis.get("mean_raster") or vis.get("spatial_distribution") or vis.get("heatmap")
+    )
 
     if img_time:
         ax_t = fig.add_axes([col_x, 0.44, col_w, 0.30])
@@ -479,16 +555,17 @@ def build_analysis_pdf(result: dict[str, Any]) -> bytes:
     - Multi-region comparisons (`region_comparison`) with side-by-side layout
     """
     buffer = io.BytesIO()
-    with PdfPages(buffer) as pdf:
-        meta = result.get("metadata", {})
-        mode = meta.get("mode", "")
+    with _PDF_LOCK:
+        with PdfPages(buffer) as pdf:
+            meta = result.get("metadata") or {}
+            mode = _text(meta.get("mode"), "")
 
-        if "variables" in result or "regions" in result or "comparison" in mode:
-            _render_comparison_report(pdf, result)
-        else:
-            _render_trend_report(pdf, result)
+            if "variables" in result or "regions" in result or "comparison" in mode:
+                _render_comparison_report(pdf, result)
+            else:
+                _render_trend_report(pdf, result)
 
-    pdf_bytes = buffer.getvalue()
+        pdf_bytes = buffer.getvalue()
     buffer.close()
     return pdf_bytes
 
