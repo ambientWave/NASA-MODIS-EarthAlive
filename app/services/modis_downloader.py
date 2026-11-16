@@ -41,7 +41,7 @@ def download_mod11a1_appeears(
     target_dir: Path | str | None = None,
     layers: list[str] | None = None,
     wait: bool = True,
-    timeout_seconds: int = 14400,
+    timeout_seconds: int = 36000, # 10 hours
     should_cancel: Callable[[], bool] | None = None,
     on_progress: Callable[[int, str], None] | None = None,
 ) -> list[Path]:
