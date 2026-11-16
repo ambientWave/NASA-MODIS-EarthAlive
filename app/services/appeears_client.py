@@ -262,7 +262,7 @@ class AppEEARSClient:
         self,
         task_id: str,
         poll_interval_seconds: int = 15,
-        timeout_seconds: int = 18000,
+        timeout_seconds: int = 36000, # 10 hours
         should_cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[int, str], None] | None = None,
     ) -> dict[str, Any]:
